@@ -1,5 +1,25 @@
 import { createApi, fetchBaseQuery } from "@reduxjs/toolkit/query/react";
+export interface User {
+  id: number;
+  username: string;
+  email: string;
+  role: "ADMIN" | "HR_MANAGER" | "EMPLOYEE";
+  employee_id: number | null;
+  is_active?: boolean;
+}
+export interface PrivateFile {
+  id: number;
+  original_name: string;
+  document_type: string;
+  visibility: string;
+  mime_type: string;
+  size_bytes: number;
+  created_at: string;
+}
 export interface Department {
+  description?: string | null;
+  manager_id?: number | null;
+  parent_id?: number | null;
   id: number;
   department_code: string;
   department_name: string;
@@ -7,6 +27,14 @@ export interface Department {
   created_at: string;
 }
 export interface Employee {
+  personal_email?: string | null;
+  phone_number?: string | null;
+  job_title?: string | null;
+  manager_id?: number | null;
+  employment_type?: string;
+  employment_status?: string;
+  work_location?: string | null;
+  photo_id?: number | null;
   id: number;
   employee_no: string;
   first_name: string;
@@ -27,12 +55,126 @@ export interface Page<T> {
   page: number;
   size: number;
 }
+export function csrfToken(): string {
+  return decodeURIComponent(
+    document.cookie
+      .split("; ")
+      .find((v) => v.startsWith("hrms_csrf="))
+      ?.split("=")
+      .slice(1)
+      .join("=") || "",
+  );
+}
+const rawQuery = fetchBaseQuery({
+  baseUrl: "/api",
+  credentials: "include",
+  prepareHeaders: (headers) => {
+    const csrf = csrfToken();
+    if (csrf) headers.set("X-CSRF-Token", csrf);
+    return headers;
+  },
+});
+let refreshing: ReturnType<typeof rawQuery> | null = null;
+const authenticatedQuery: typeof rawQuery = async (args, ctx, options) => {
+  let result = await rawQuery(args, ctx, options);
+  const url = typeof args === "string" ? args : args.url;
+  if (
+    result.error?.status === 401 &&
+    !["/auth/login", "/auth/refresh", "/auth/logout"].includes(url)
+  ) {
+    refreshing ||= rawQuery(
+      { url: "/auth/refresh", method: "POST" },
+      ctx,
+      options,
+    );
+    const refreshed = await refreshing;
+    refreshing = null;
+    if (!refreshed.error) result = await rawQuery(args, ctx, options);
+  }
+  return result;
+};
 export const api = createApi({
   reducerPath: "hrmsApi",
-  baseQuery: fetchBaseQuery({ baseUrl: "/api" }),
-  tagTypes: ["Department", "Employee"],
+  baseQuery: authenticatedQuery,
+  tagTypes: ["Department", "Employee", "Session", "User", "File", "Audit"],
   endpoints: (build) => ({
-    departments: build.query<Page<Department>, { page: number; size: number }>({
+    me: build.query<User, void>({
+      query: () => "/auth/me",
+      providesTags: ["Session"],
+    }),
+    login: build.mutation<User, { login: string; password: string }>({
+      query: (body) => ({ url: "/auth/login", method: "POST", body }),
+      invalidatesTags: ["Session"],
+    }),
+    logout: build.mutation<void, void>({
+      query: () => ({ url: "/auth/logout", method: "POST" }),
+    }),
+    password: build.mutation<
+      void,
+      { current_password: string; new_password: string }
+    >({ query: (body) => ({ url: "/auth/password", method: "POST", body }) }),
+    users: build.query<User[], number>({
+      query: (page) => ({ url: "/users", params: { page, size: 20 } }),
+      providesTags: ["User"],
+    }),
+    createUser: build.mutation<User, Record<string, unknown>>({
+      query: (body) => ({ url: "/users", method: "POST", body }),
+      invalidatesTags: ["User"],
+    }),
+    updateUser: build.mutation<
+      User,
+      { id: number; body: Record<string, unknown> }
+    >({
+      query: ({ id, body }) => ({ url: `/users/${id}`, method: "PATCH", body }),
+      invalidatesTags: ["User", "Session"],
+    }),
+    audit: build.query<Record<string, unknown>[], number>({
+      query: (page) => ({ url: "/audit", params: { page, size: 20 } }),
+      providesTags: ["Audit"],
+    }),
+    hierarchy: build.query<{ items: Department[]; truncated: boolean }, void>({
+      query: () => "/department-hierarchy",
+      providesTags: ["Department"],
+    }),
+    documents: build.query<
+      { items: PrivateFile[]; page: number; size: number },
+      { id: number; page: number }
+    >({
+      query: ({ id, page }) => ({
+        url: `/employees/${id}/documents`,
+        params: { page, size: 20 },
+      }),
+      providesTags: ["File"],
+    }),
+    upload: build.mutation<
+      PrivateFile,
+      { id: number; photo: boolean; body: FormData }
+    >({
+      query: ({ id, photo, body }) => ({
+        url: `/employees/${id}/${photo ? "photo" : "documents"}`,
+        method: "POST",
+        body,
+      }),
+      invalidatesTags: ["File", "Employee"],
+    }),
+    archive: build.mutation<void, { id: number; file: number }>({
+      query: ({ id, file }) => ({
+        url: `/employees/${id}/documents/${file}/archive`,
+        method: "POST",
+      }),
+      invalidatesTags: ["File"],
+    }),
+    departments: build.query<
+      Page<Department>,
+      {
+        page: number;
+        size: number;
+        q?: string;
+        department_id?: number;
+        employment_status?: string;
+        is_active?: boolean;
+      }
+    >({
       query: (params) => ({ url: "/departments", params }),
       providesTags: ["Department"],
     }),
@@ -46,7 +188,7 @@ export const api = createApi({
     }),
     updateDepartment: build.mutation<
       Department,
-      { id: string; body: { department_name: string } }
+      { id: string; body: Partial<Department> }
     >({
       query: ({ id, body }) => ({
         url: `/departments/${id}`,
@@ -59,7 +201,17 @@ export const api = createApi({
       query: (id) => ({ url: `/departments/${id}/deactivate`, method: "POST" }),
       invalidatesTags: ["Department"],
     }),
-    employees: build.query<Page<Employee>, { page: number; size: number }>({
+    employees: build.query<
+      Page<Employee>,
+      {
+        page: number;
+        size: number;
+        q?: string;
+        department_id?: number;
+        status?: string;
+        is_active?: boolean;
+      }
+    >({
       query: (params) => ({ url: "/employees", params }),
       providesTags: ["Employee"],
     }),
@@ -89,6 +241,18 @@ export const api = createApi({
   }),
 });
 export const {
+  useMeQuery,
+  useLoginMutation,
+  useLogoutMutation,
+  usePasswordMutation,
+  useUsersQuery,
+  useCreateUserMutation,
+  useUpdateUserMutation,
+  useAuditQuery,
+  useHierarchyQuery,
+  useDocumentsQuery,
+  useUploadMutation,
+  useArchiveMutation,
   useDepartmentsQuery,
   useDepartmentQuery,
   useCreateDepartmentMutation,

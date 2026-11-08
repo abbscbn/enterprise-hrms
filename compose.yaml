@@ -28,6 +28,11 @@ services:
       <<: *oracle-env
       HRMS_OUTBOX_ENABLED: ${HRMS_OUTBOX_ENABLED:-0}
       HRMS_PLSQL_ENABLED: ${HRMS_PLSQL_ENABLED:-0}
+      HRMS_ENTERPRISE_ENABLED: ${HRMS_ENTERPRISE_ENABLED:-1}
+      HRMS_ENV: development
+      HRMS_COOKIE_SECURE: "0"
+      HRMS_STORAGE_ROOT: /var/lib/hrms-files
+    volumes: [employee-files:/var/lib/hrms-files]
     ports: ["127.0.0.1:8000:8000"]
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
@@ -70,3 +75,4 @@ services:
 volumes:
   rabbitmq-data:
   notification-data:
+  employee-files:

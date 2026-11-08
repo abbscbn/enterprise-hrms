@@ -3,7 +3,7 @@ import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { Provider } from "react-redux";
 import { MemoryRouter } from "react-router-dom";
-import App, { employeePayload } from "../App";
+import { Workspace, employeePayload } from "../App";
 import { makeStore, notify, dismiss } from "../store";
 import { api, errorMessage } from "../api";
 const department = {
@@ -17,21 +17,27 @@ function show(path: string) {
   return render(
     <Provider store={makeStore()}>
       <MemoryRouter initialEntries={[path]}>
-        <App />
+        <Workspace
+          user={{
+            id: 1,
+            username: "testadmin",
+            email: "test@example.invalid",
+            role: "ADMIN",
+            employee_id: null,
+          }}
+        />
       </MemoryRouter>
     </Provider>,
   );
 }
 function mockFetch(items: unknown[] = []) {
-  return vi
-    .spyOn(globalThis, "fetch")
-    .mockImplementation(
-      async () =>
-        new Response(JSON.stringify({ items, page: 1, size: 10 }), {
-          status: 200,
-          headers: { "content-type": "application/json" },
-        }),
-    );
+  return vi.spyOn(globalThis, "fetch").mockImplementation(
+    async () =>
+      new Response(JSON.stringify({ items, page: 1, size: 10 }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+  );
 }
 // fetchBaseQuery builds Request from relative browser URL; Node needs an absolute URL.
 const RealRequest = globalThis.Request;
@@ -62,7 +68,9 @@ describe("MVP UI", () => {
     mockFetch([department]);
     show("/departments");
     expect(await screen.findByText("Mühendislik")).toBeInTheDocument();
-    expect(screen.getByText("Aktif")).toBeInTheDocument();
+    expect(
+      screen.getByText("Aktif", { selector: "span.badge" }),
+    ).toBeInTheDocument();
   });
   it("shows safe service errors", async () => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(

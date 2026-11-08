@@ -1,3 +1,14 @@
+import {
+  Account,
+  Audit,
+  Forbidden,
+  Hierarchy,
+  Login,
+  Logout,
+  Profile,
+  Users,
+} from "./Enterprise";
+import { useMeQuery, type User } from "./api";
 import { useEffect, useState, type FormEvent, type ReactNode } from "react";
 import {
   Link,
@@ -209,13 +220,28 @@ function Pagination({
 function ResourceList({ kind }: { kind: "departments" | "employees" }) {
   const employee = kind === "employees";
   const [page, setPage] = useState(1);
+  const [search, setSearch] = useState("");
+  const [filter, setFilter] = useState("");
   const [pending, setPending] = useState<Department | Employee | null>(null);
   const [operationError, setOperationError] = useState<unknown>(null);
   const departments = useDepartmentsQuery(
-    { page, size: 10 },
+    {
+      page,
+      size: 10,
+      q: search || undefined,
+      is_active: filter ? filter === "ACTIVE" : undefined,
+    },
     { skip: employee },
   );
-  const employees = useEmployeesQuery({ page, size: 10 }, { skip: !employee });
+  const employees = useEmployeesQuery(
+    {
+      page,
+      size: 10,
+      q: search || undefined,
+      status: filter || undefined,
+    },
+    { skip: !employee },
+  );
   const query = employee ? employees : departments;
   const [deactivateDepartment, ds] = useDeactivateDepartmentMutation();
   const [deactivateEmployee, es] = useDeactivateEmployeeMutation();
@@ -249,6 +275,41 @@ function ResourceList({ kind }: { kind: "departments" | "employees" }) {
           </Link>
         }
       />
+      <div className="enterprise-card">
+        <label>
+          Ara
+          <input
+            aria-label="Rehberde ara"
+            value={search}
+            maxLength={100}
+            onChange={(e) => {
+              setSearch(e.target.value);
+              setPage(1);
+            }}
+          />
+        </label>
+        <label>
+          Durum filtresi
+          <select
+            value={filter}
+            onChange={(e) => {
+              setFilter(e.target.value);
+              setPage(1);
+            }}
+          >
+            <option value="">Tümü</option>
+            <option value="ACTIVE">Aktif</option>
+            {employee ? (
+              <>
+                <option value="ON_LEAVE">İzinli</option>
+                <option value="TERMINATED">Ayrılmış</option>
+              </>
+            ) : (
+              <option value="INACTIVE">Pasif</option>
+            )}
+          </select>
+        </label>
+      </div>
       <div className="panel table-panel">
         <div className="table-top">
           <h2>{employee ? "Personel rehberi" : "Departman rehberi"}</h2>
@@ -375,6 +436,9 @@ function DepartmentForm() {
   const query = useDepartmentQuery(id ?? "", { skip: !editing });
   const [code, setCode] = useState("");
   const [name, setName] = useState("");
+  const [description, setDescription] = useState("");
+  const [parent, setParent] = useState("");
+  const [manager, setManager] = useState("");
   const [error, setError] = useState<unknown>(null);
   const [create, cs] = useCreateDepartmentMutation();
   const [update, us] = useUpdateDepartmentMutation();
@@ -384,6 +448,9 @@ function DepartmentForm() {
     if (query.data) {
       setCode(query.data.department_code);
       setName(query.data.department_name);
+      setDescription(query.data.description ?? "");
+      setParent(String(query.data.parent_id ?? ""));
+      setManager(String(query.data.manager_id ?? ""));
     }
   }, [query.data]);
   async function submit(event: FormEvent) {
@@ -395,11 +462,24 @@ function DepartmentForm() {
     }
     try {
       if (id)
-        await update({ id, body: { department_name: name.trim() } }).unwrap();
+        await update({
+          id,
+          body: {
+            department_name: name.trim(),
+            description: description || null,
+            parent_id: parent ? Number(parent) : null,
+            manager_id: manager ? Number(manager) : null,
+          },
+        }).unwrap();
       else
         await create({
           department_code: code.trim(),
           department_name: name.trim(),
+          ...{
+            description: description || null,
+            parent_id: parent ? Number(parent) : null,
+            manager_id: manager ? Number(manager) : null,
+          },
         }).unwrap();
       dispatch(notify("Departman kaydedildi."));
       navigate("/departments");
@@ -442,6 +522,32 @@ function DepartmentForm() {
               value={name}
               onChange={(e) => setName(e.target.value)}
               placeholder="Örn. Mühendislik"
+            />
+          </label>
+          <label>
+            Açıklama
+            <textarea
+              maxLength={1000}
+              value={description}
+              onChange={(e) => setDescription(e.target.value)}
+            />
+          </label>
+          <label>
+            Üst departman ID
+            <input
+              type="number"
+              min={1}
+              value={parent}
+              onChange={(e) => setParent(e.target.value)}
+            />
+          </label>
+          <label>
+            Yönetici personel ID
+            <input
+              type="number"
+              min={1}
+              value={manager}
+              onChange={(e) => setManager(e.target.value)}
             />
           </label>
           {error !== null && <Failure error={error} />}
@@ -681,7 +787,7 @@ function EmployeeDetail() {
     </>
   );
 }
-export default function App() {
+export function Workspace({ user }: { user: User }) {
   const message = useSelector((state: RootState) => state.ui.message);
   const dispatch = useDispatch();
   useEffect(() => {
@@ -701,43 +807,109 @@ export default function App() {
         </Link>
         <p className="nav-label">ÇALIŞMA ALANI</p>
         <nav>
-          <NavLink to="/" end>
-            <span>◈</span> Genel bakış
-          </NavLink>
-          <NavLink to="/departments">
-            <span>▦</span> Departmanlar
-          </NavLink>
-          <NavLink to="/employees">
-            <span>♧</span> Personel
-          </NavLink>
+          {user.role !== "EMPLOYEE" && (
+            <>
+              <NavLink to="/" end>
+                <span>◈</span> Genel bakış
+              </NavLink>
+              <NavLink to="/departments">
+                <span>▦</span> Departmanlar
+              </NavLink>
+              <NavLink to="/employees">
+                <span>♧</span> Personel
+              </NavLink>
+            </>
+          )}
+          <NavLink to="/account">Hesabım</NavLink>
+          <NavLink to="/organization">Organizasyon</NavLink>
+          {user.role !== "EMPLOYEE" && (
+            <NavLink to="/users">Kullanıcılar ve roller</NavLink>
+          )}
+          {user.role === "ADMIN" && (
+            <NavLink to="/audit">Denetim günlüğü</NavLink>
+          )}
         </nav>
         <div className="sidebar-note">
-          <i /> Geliştirme ortamı<small>Enterprise HRMS · MVP v1</small>
+          <i /> Geliştirme ortamı<small>Enterprise HRMS · MVP v2</small>
         </div>
       </aside>
       <div className="workspace">
         <div className="topbar">
           <span>Organizasyon yönetimi</span>
           <div>
-            <span className="workspace-badge">HR</span> İnsan Kaynakları
+            <span className="workspace-badge">{user.role}</span> {user.username}{" "}
+            <Logout />
           </div>
         </div>
         <main>
           <Routes>
-            <Route path="/" element={<Dashboard />} />
+            <Route path="/account" element={<Account user={user} />} />
+            <Route path="/organization" element={<Hierarchy />} />
+            <Route
+              path="/users"
+              element={
+                user.role !== "EMPLOYEE" ? <Users user={user} /> : <Forbidden />
+              }
+            />
+            <Route
+              path="/audit"
+              element={user.role === "ADMIN" ? <Audit /> : <Forbidden />}
+            />
+            <Route
+              path="/"
+              element={
+                user.role !== "EMPLOYEE" ? (
+                  <Dashboard />
+                ) : (
+                  <Account user={user} />
+                )
+              }
+            />
             <Route
               path="/departments"
-              element={<ResourceList key="departments" kind="departments" />}
+              element={
+                user.role !== "EMPLOYEE" ? (
+                  <ResourceList key="departments" kind="departments" />
+                ) : (
+                  <Forbidden />
+                )
+              }
             />
-            <Route path="/departments/new" element={<DepartmentForm />} />
-            <Route path="/departments/:id/edit" element={<DepartmentForm />} />
+            <Route
+              path="/departments/new"
+              element={
+                user.role !== "EMPLOYEE" ? <DepartmentForm /> : <Forbidden />
+              }
+            />
+            <Route
+              path="/departments/:id/edit"
+              element={
+                user.role !== "EMPLOYEE" ? <DepartmentForm /> : <Forbidden />
+              }
+            />
             <Route
               path="/employees"
-              element={<ResourceList key="employees" kind="employees" />}
+              element={
+                user.role !== "EMPLOYEE" ? (
+                  <ResourceList key="employees" kind="employees" />
+                ) : (
+                  <Forbidden />
+                )
+              }
             />
-            <Route path="/employees/new" element={<EmployeeForm />} />
-            <Route path="/employees/:id/edit" element={<EmployeeForm />} />
-            <Route path="/employees/:id" element={<EmployeeDetail />} />
+            <Route
+              path="/employees/new"
+              element={
+                user.role !== "EMPLOYEE" ? <EmployeeForm /> : <Forbidden />
+              }
+            />
+            <Route
+              path="/employees/:id/edit"
+              element={
+                user.role !== "EMPLOYEE" ? <EmployeeForm /> : <Forbidden />
+              }
+            />
+            <Route path="/employees/:id" element={<Profile user={user} />} />
             <Route
               path="*"
               element={
@@ -766,4 +938,22 @@ export default function App() {
       )}
     </div>
   );
+}
+
+export default function App() {
+  const { data, error, isLoading } = useMeQuery();
+  if (isLoading)
+    return (
+      <main className="login-page" role="status">
+        Oturum doğrulanıyor…
+      </main>
+    );
+  if (data) return <Workspace user={data} />;
+  if (error && "status" in error && error.status !== 401)
+    return (
+      <main className="login-page">
+        <p role="alert">{errorMessage(error)}</p>
+      </main>
+    );
+  return <Login />;
 }
