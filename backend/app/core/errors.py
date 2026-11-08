@@ -14,6 +14,30 @@ class ApplicationError(RuntimeError):
         super().__init__(self.message)
 
 
+class Unauthorized(ApplicationError):
+    status_code = 401
+    code = "unauthorized"
+    message = "Oturum geçersiz veya süresi dolmuş."
+
+
+class Forbidden(ApplicationError):
+    status_code = 403
+    code = "forbidden"
+    message = "Bu işlem için yetkiniz yok."
+
+
+class TooManyRequests(ApplicationError):
+    status_code = 429
+    code = "rate_limited"
+    message = "Çok fazla giriş denemesi. Daha sonra tekrar deneyin."
+
+
+class UploadRejected(ApplicationError):
+    status_code = 422
+    code = "upload_rejected"
+    message = "Dosya biçimi, boyutu veya içeriği kabul edilmedi."
+
+
 class NotFound(ApplicationError):
     status_code = 404
     code = "not_found"
@@ -66,7 +90,7 @@ def safe_error(error: Exception) -> ApplicationError:
         if type(code) is int:
             if code == 20003:
                 return NotFound()
-            if code in (20001, 20002):
+            if code in (20001, 20002, 20004, 20005, 20006):
                 return Conflict()
             if code == 1:
                 return UniqueConflict()

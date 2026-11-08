@@ -36,3 +36,14 @@ servisleri birlikte çalıştırır. Git/GitHub sürüm kontrolüdür. Katmanlar
     görev dosyalarını seçerek stage et. Push başarısızsa force/rebase ile aşma.
 13. Mevcut Oracle container ve kalıcı verileri koru; ikinci bağımsız Oracle oluşturma.
 14. Sonunda değişiklikleri, test/entegrasyon kanıtlarını ve kalan engelleri Türkçe özetle.
+
+## Kurumsal güvenlik ve dosya ilkeleri
+
+- Kimlik doğrulama ve nesne yetkisi backend'de zorunludur; frontend gizleme güvenlik değildir.
+- Parola, token veya belge içeriğini audit/mesaj/loglara koyma. Token'ları hash'le;
+  refresh rotation ve iptal sözleşmelerini koru. Cookie yazmalarında CSRF kontrolü yap.
+- Fotoğraf/belgeler private storage'dadır; istemci dosya adını storage yolu yapma.
+  İçerik/boyut doğrula, photo metadata'sını temizle. Commit belirsizliğinde dosyayı
+  otomatik silme; reconciliation gereksinimini görünür tut.
+- Mevcut kayıtları koruyan ek tablolar ve ileri yönlü sürümler tercih edilir. Yeni
+  SQL biçimleri için kontrollü kaynak manifesti, metadata doğrulaması ve gerçek TTY gerekir.

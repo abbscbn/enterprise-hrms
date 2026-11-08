@@ -39,6 +39,12 @@ def driver_error(code=1):
 
 class OfflineCase(unittest.TestCase):
     def setUp(self):
+        from backend.app.security.dependencies import get_current_user
+        from backend.app.security.models import Principal
+        original_overrides = app.dependency_overrides.copy()
+        self.addCleanup(lambda: (app.dependency_overrides.clear(), app.dependency_overrides.update(original_overrides)))
+        app.dependency_overrides[get_current_user] = lambda: Principal(1,'synthetic_admin','admin@example.invalid','ADMIN')
+        self.enterContext(patch.dict('os.environ',{'HRMS_ENTERPRISE_ENABLED':'0'}))
         self.real_connect = self.enterContext(patch('oracledb.connect', side_effect=AssertionError('Gerçek Oracle yasak')))
         self.settings = self.enterContext(patch.object(config, 'load_dotenv', side_effect=AssertionError('.env okuma yasak')))
         self.target = self.enterContext(patch("backend.app.db.transactions.validate_target_session"))
@@ -58,7 +64,7 @@ class OfflineCase(unittest.TestCase):
 class SchemaTests(OfflineCase):
     def test_department_create_trims_strings(self):
         result = DepartmentCreate(department_code=' ENG ', department_name=' Engineering ')
-        self.assertEqual(result.model_dump(), {'department_code': 'ENG', 'department_name': 'Engineering'})
+        self.assertEqual(result.model_dump(exclude_unset=True), {'department_code': 'ENG', 'department_name': 'Engineering'})
 
     def test_employee_create_trims_and_keeps_nullable_email(self):
         result = EmployeeCreate(**{**CREATE_EMP, 'first_name': ' Ada ', 'email': None})
@@ -621,6 +627,9 @@ class RouteTests(OfflineCase):
     def test_response_after_request_connection_cleanup_failure_is_not_silent_success(self):
         from backend.app.db import dependencies
         app.dependency_overrides.clear()
+        from backend.app.security.dependencies import get_current_user
+        from backend.app.security.models import Principal
+        app.dependency_overrides[get_current_user] = lambda: Principal(1,'synthetic_admin','admin@example.invalid','ADMIN')
         self.cursor.var.return_value.getvalue.return_value = [1]
         self.cursor.fetchone.return_value = DEPT_ROW
         self.connection.close.side_effect = oracledb.DatabaseError('RAW_PASSWORD_SQL_DSN')

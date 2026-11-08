@@ -17,11 +17,21 @@ class EmployeeRepository:
             cursor.execute(SELECT + " WHERE ID=:id" + (" FOR UPDATE WAIT 5" if for_update else ""), {"id": identifier})
             return record(cursor.fetchone(), FIELDS)
 
-    def list(self, page, size):
+    def list(self, page, size, search=None, department_id=None, status=None):
+        sql=SELECT
+        params={"offset":(page-1)*size,"limit":size};conditions=[]
+        if status:
+            sql+=' LEFT JOIN HR_CORE.EMPLOYEE_PROFILE P ON P.EMPLOYEE_ID=ID'
+            conditions.append("COALESCE(P.EMPLOYMENT_STATUS,CASE WHEN IS_ACTIVE=1 THEN 'ACTIVE' ELSE 'TERMINATED' END)=:status")
+            params['status']=status
+        if department_id is not None:conditions.append('DEPARTMENT_ID=:department_id');params['department_id']=department_id
+        if search:
+            conditions.append("INSTR(UPPER(FIRST_NAME||' '||LAST_NAME||' '||EMPLOYEE_NO||' '||EMAIL),UPPER(:search))>0")
+            params['search']=search
+        if conditions:sql+=' WHERE '+' AND '.join(conditions)
         with self.connection.cursor() as cursor:
-            cursor.execute(SELECT + " ORDER BY ID OFFSET :offset ROWS FETCH NEXT :limit ROWS ONLY",
-                           {"offset": (page - 1) * size, "limit": size})
-            return [record(row, FIELDS) for row in cursor.fetchall()]
+            cursor.execute(sql + " ORDER BY ID OFFSET :offset ROWS FETCH NEXT :limit ROWS ONLY",params)
+            return [record(row,FIELDS) for row in cursor.fetchall()]
 
     def has_active(self, department_id):
         with self.connection.cursor() as cursor:

@@ -14,11 +14,13 @@ class DepartmentRepository:
             cursor.execute(SELECT + " WHERE ID=:id" + (" FOR UPDATE WAIT 5" if for_update else ""), {"id": identifier})
             return record(cursor.fetchone(), FIELDS)
 
-    def list(self, page, size):
+    def list(self, page, size, search=None, is_active=None):
+        params={"offset":(page-1)*size,"limit":size};conditions=[]
+        if search:conditions.append("INSTR(UPPER(DEPARTMENT_CODE||' '||DEPARTMENT_NAME),UPPER(:search))>0");params['search']=search
+        if is_active is not None:conditions.append('IS_ACTIVE=:active');params['active']=int(is_active)
         with self.connection.cursor() as cursor:
-            cursor.execute(SELECT + " ORDER BY ID OFFSET :offset ROWS FETCH NEXT :limit ROWS ONLY",
-                           {"offset": (page - 1) * size, "limit": size})
-            return [record(row, FIELDS) for row in cursor.fetchall()]
+            cursor.execute(SELECT+(' WHERE '+' AND '.join(conditions) if conditions else '')+" ORDER BY ID OFFSET :offset ROWS FETCH NEXT :limit ROWS ONLY",params)
+            return [record(row,FIELDS) for row in cursor.fetchall()]
 
     def create(self, values):
         with self.connection.cursor() as cursor:

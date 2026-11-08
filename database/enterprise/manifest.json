@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "sha256": "fc4606ea59326304064832b8a978c56deb418ef4879d659335db8a1a22e56b93",
+  "files": {
+    "database/migrations/V0005__create_hrms_user.sql": "87a4e473e2e022b5130eb215c46a4f89967951624b2e56a283218e09f14f86df",
+    "database/migrations/V0006__create_hrms_session.sql": "5f239fabb9ccddaba3b2559ab780b0250ba978b49584c9281935e505953f3bbf",
+    "database/migrations/V0007__create_hrms_refresh_used.sql": "ad57f1becd49409723562f995d172ae947340098dabc46e576a13269b4d7ef09",
+    "database/migrations/V0008__create_hrms_login_guard.sql": "bc5cd1e2b7bb207ff9fd0ec93ad905e84ed88d76d47414d76d49f615f0e724f7",
+    "database/migrations/V0009__create_hrms_audit.sql": "7652701f456491b0fea8b92aa2f27eaa1df670b62cb7bf49e77035965eaaaf8d",
+    "database/migrations/V0010__create_hrms_file.sql": "789ad5aa8c525b094b63fad49cbd154546895d6ff31ea7756e5298f61bb243c9",
+    "database/migrations/V0011__create_employee_profile.sql": "2b50d75abb3c7ae1de8c0363753d1c58ae84a04db648788d99d8d20db2d0505c",
+    "database/migrations/V0012__create_department_profile.sql": "16bebd39023b9fa0acfeeb2b31f8f3c37b6152e41c38300dd718f0469ee1cdef",
+    "database/migrations/V0013__create_hrms_hierarchy_guard.sql": "49be7f25128ecc52380c6660911fe09f91ef2e98089cb623649cd7d320c6dd83",
+    "database/enterprise/HRMS_ENTERPRISE_spec.sql": "2a02e6c5541568e7bcfddf10de494dd7983d52b59abfad7070c668afec27090b",
+    "database/enterprise/HRMS_ENTERPRISE_body.sql": "fcacdeb0bed7b93feacae453fb1b06639855e02a6839648d71693203b6a2ea47",
+    "database/enterprise/seed_guard.sql": "d3da9379a04530b03e5ccd96f36e1c87cf866293284961f4ce63047d70c13da9"
+  }
+}

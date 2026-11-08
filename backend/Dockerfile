@@ -3,6 +3,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 WORKDIR /app
 COPY backend/requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir -r /tmp/requirements.txt && useradd --uid 10001 --create-home appuser
+RUN mkdir -p /var/lib/hrms-files && chown appuser:appuser /var/lib/hrms-files
 COPY backend /app/backend
 USER appuser
 EXPOSE 8000

@@ -33,3 +33,19 @@ class DeploymentSourceTests(unittest.TestCase):
             with patch.object(deploy,'ROOT',root),self.assertRaises(ValueError):deploy.sources()
 
 if __name__=='__main__':unittest.main()
+
+class EnterpriseDeploymentSourceTests(unittest.TestCase):
+    def setUp(self):
+        spec=importlib.util.spec_from_file_location('tested_enterprise_deploy',PATH.with_name('deploy_enterprise.py'))
+        self.deploy=importlib.util.module_from_spec(spec);spec.loader.exec_module(self.deploy)
+
+    def test_controlled_bundle_hash_matches_deployed_artifacts(self):
+        artifacts,fingerprint=self.deploy.sources()
+        self.assertEqual(len(artifacts),12)
+        self.assertEqual(fingerprint,'fc4606ea59326304064832b8a978c56deb418ef4879d659335db8a1a22e56b93')
+
+    def test_changed_schema_file_rejected_without_connection(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);shutil.copytree(self.deploy.ROOT/'database',root/'database')
+            path=root/'database/migrations/V0005__create_hrms_user.sql';path.write_bytes(path.read_bytes()+b'\n')
+            with patch.object(self.deploy,'ROOT',root),patch('oracledb.connect',side_effect=AssertionError('No connection')),self.assertRaises(ValueError):self.deploy.sources()

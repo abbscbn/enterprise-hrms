@@ -4,3 +4,8 @@ httpx==0.28.1
 oracledb==26.1.0
 python-dotenv==1.2.4
 pika==1.4.4
+argon2-cffi==25.1.0
+python-multipart==0.0.33
+Pillow==13.0.0
+pypdf==7.0.0
+defusedxml==0.7.1

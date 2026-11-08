@@ -1,4 +1,4 @@
-from typing import Annotated
+from typing import Annotated, ClassVar
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
@@ -10,11 +10,12 @@ class InputModel(BaseModel):
 
 
 class PatchModel(InputModel):
+    nullable_fields: ClassVar[set[str]] = {"email"}
     @model_validator(mode="after")
     def validate_changes(self):
         if not self.model_fields_set:
             raise ValueError("En az bir değişiklik gönderilmelidir.")
         for name in self.model_fields_set:
-            if name != "email" and getattr(self, name) is None:
+            if name not in self.nullable_fields and getattr(self, name) is None:
                 raise ValueError("Zorunlu alan null olamaz.")
         return self

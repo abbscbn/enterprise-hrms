@@ -13,3 +13,6 @@ coverage/
 *.log
 .pytest_cache/
 *.tsbuildinfo
+.secrets/
+uploads/
+private-storage/
