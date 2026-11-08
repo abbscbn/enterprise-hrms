@@ -2930,14 +2930,16 @@ class TableSafetyComparisonTests(OfflineTestCase):
             with self.subTest(change=change):
                 self.assert_blocked(replace(self.safety, **change))
 
-    def test_default_presence_is_mismatch_without_reading_expression(self):
-        self.assert_blocked(self.property_change(default_length=4))
+    def test_unexpected_default_with_complete_metadata_is_mismatch(self):
+        self.assert_blocked(self.property_change(default_length=4, default_expression="1", default_on_null="NO"))
 
     def test_zero_default_length_is_not_silently_normalized_to_absence(self):
-        self.assert_blocked(self.property_change(default_length=0))
+        self.assert_blocked(self.property_change(default_length=0), migrate.StructureComparisonStatus.INVALID_METADATA)
 
     def test_identity_and_virtual_are_mismatches(self):
-        for change in ({"identity": "YES"}, {"virtual": "YES"}):
+        for change in ({"identity": "YES", "default_length": 30, "default_expression": '"HR_CORE"."ISEQ$$_42".nextval',
+                        "default_on_null": "NO", "identity_generation": "ALWAYS", "identity_sequence": "ISEQ$$_42"},
+                       {"virtual": "YES"}):
             with self.subTest(change=change):
                 self.assert_blocked(self.property_change(**change))
 
@@ -3008,7 +3010,10 @@ class TableSafetyComparisonTests(OfflineTestCase):
         for kind, condition in (("U", None), ("R", None), ("C", "ID > 0")):
             with self.subTest(kind=kind):
                 extra = migrate.OracleConstraintMetadata(
-                    "EXTRA", kind, "ENABLED", "VALIDATED", "NOT DEFERRABLE", "IMMEDIATE", condition)
+                    "EXTRA", kind, "ENABLED", "VALIDATED", "NOT DEFERRABLE", "IMMEDIATE", condition,
+                    ("ID",) if kind in ("U", "R") else None,
+                    migrate.OracleForeignKeyReference("HR_CORE", "OTHER", "PK_OTHER", "P", ("ID",),
+                        "NO ACTION", "ENABLED", "VALIDATED") if kind == "R" else None)
                 self.assert_blocked(replace(self.safety, constraints=self.safety.constraints + (extra,)))
 
     def test_safe_not_null_parentheses_and_keyword_case_are_accepted(self):
@@ -4355,6 +4360,883 @@ class ExecutionClassificationTests(OfflineTestCase):
         self.assertEqual(first, self.classify(migrate.DDLOutcome.UNKNOWN))
         with self.assertRaises(FrozenInstanceError):
             first.failed_reason = "DDL_REJECTED"
+
+
+class UniqueParserTests(OfflineTestCase):
+    def parse(self, tail, columns="id NUMBER(19,0) NOT NULL, code VARCHAR2(30 CHAR), email VARCHAR2(50 CHAR)"):
+        return migrate.validate_create_table(f"CREATE TABLE employees ({columns}, {tail});")
+
+    def test_named_single_unique_with_pk(self):
+        model = self.parse("CONSTRAINT pk_employees PRIMARY KEY(id), CONSTRAINT uq_code UNIQUE(code)")
+        self.assertEqual(model.unique_constraints, (migrate.UniqueConstraintDefinition("UQ_CODE", "CODE"),))
+        self.assertEqual(model.primary_key.columns, ("ID",))
+        self.assertEqual(model.primary_key_constraint_name, "PK_EMPLOYEES")
+
+    def test_two_distinct_unique_constraints(self):
+        model = self.parse("CONSTRAINT uq_code UNIQUE(code), CONSTRAINT uq_email UNIQUE(email)")
+        self.assertEqual(tuple((c.constraint_name, c.column_name) for c in model.unique_constraints),
+                         (("UQ_CODE", "CODE"), ("UQ_EMAIL", "EMAIL")))
+        self.assertIsNone(model.primary_key)
+
+    def test_unique_before_unnamed_composite_pk(self):
+        model = self.parse("CONSTRAINT uq_code UNIQUE(code), PRIMARY KEY(email,id)")
+        self.assertEqual(model.primary_key.columns, ("EMAIL", "ID"))
+        self.assertIsNone(model.primary_key_constraint_name)
+
+    def test_unique_models_are_immutable_and_do_not_imply_not_null(self):
+        model = self.parse("CONSTRAINT uq_code UNIQUE(code)")
+        self.assertIs(type(model.unique_constraints), tuple)
+        self.assertFalse(model.column_definitions[1].explicit_not_null)
+        with self.assertRaises(FrozenInstanceError):
+            model.unique_constraints[0].column_name = "EMAIL"
+        with self.assertRaises(FrozenInstanceError):
+            model.unique_constraints = ()
+
+    def test_missing_unique_column_rejected(self):
+        with self.assertRaises(ValueError):
+            self.parse("CONSTRAINT uq_code UNIQUE(missing)")
+
+    def test_duplicate_constraint_names_including_pk_rejected(self):
+        for tail in (
+            "CONSTRAINT uq_code UNIQUE(code), CONSTRAINT uq_code UNIQUE(email)",
+            "CONSTRAINT uq_code PRIMARY KEY(id), CONSTRAINT uq_code UNIQUE(code)",
+            "CONSTRAINT uq_code UNIQUE(code), CONSTRAINT uq_code PRIMARY KEY(id)",
+        ):
+            with self.subTest(tail=tail), self.assertRaises(ValueError):
+                self.parse(tail)
+
+    def test_duplicate_unique_column_rejected(self):
+        with self.assertRaises(ValueError):
+            self.parse("CONSTRAINT uq_code UNIQUE(code), CONSTRAINT uq_other UNIQUE(code)")
+
+    def test_composite_unnamed_and_function_unique_rejected(self):
+        for tail in ("CONSTRAINT uq_code UNIQUE(code,email)", "UNIQUE(code)",
+                     "CONSTRAINT uq_code UNIQUE(LOWER(code))"):
+            with self.subTest(tail=tail), self.assertRaises(ValueError):
+                self.parse(tail)
+
+    def test_inline_unique_rejected(self):
+        for column in ("code VARCHAR2(30 CHAR) UNIQUE", "code VARCHAR2(30 CHAR) CONSTRAINT uq_code UNIQUE"):
+            with self.subTest(column=column), self.assertRaises(ValueError):
+                migrate.validate_create_table(f"CREATE TABLE employees ({column})")
+
+    def test_unique_options_rejected(self):
+        for option in ("DEFERRABLE", "ENABLE", "DISABLE", "NOVALIDATE", "USING INDEX"):
+            with self.subTest(option=option), self.assertRaises(ValueError):
+                self.parse(f"CONSTRAINT uq_code UNIQUE(code) {option}")
+
+    def test_identifiers_and_statement_boundary_remain_strict(self):
+        for name in ('"UQ_CODE"', "HR_CORE.UQ_CODE", "UQ$CODE", "U" * 31, "SYS_UQ_CODE"):
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                self.parse(f"CONSTRAINT {name} UNIQUE(code)")
+        for suffix in ("; CREATE TABLE other (id NUMBER)", " USING INDEX", " ENABLE"):
+            with self.subTest(suffix=suffix), self.assertRaises(ValueError):
+                migrate.validate_create_table("CREATE TABLE employees (code NUMBER, CONSTRAINT uq_code UNIQUE(code))" + suffix)
+
+    def test_columns_after_constraints_and_second_pk_rejected(self):
+        for tail in ("CONSTRAINT uq_code UNIQUE(code), extra NUMBER", "PRIMARY KEY(id), PRIMARY KEY(code)"):
+            with self.subTest(tail=tail), self.assertRaises(ValueError):
+                self.parse(tail)
+
+    def test_v0001_bytes_checksum_and_model_unchanged(self):
+        path = migrate.MIGRATIONS_DIRECTORY / "V0001__create_hrms_it_a101_exec_r01.sql"
+        raw = path.read_bytes()
+        self.assertEqual(hashlib.sha256(raw).hexdigest(),
+                         "5c92f2817932a27dca61f1b937cecdb08d40ac3c8495ca7eab429eab984aeb2b")
+        model = migrate.validate_create_table(raw.decode("utf-8"))
+        self.assertEqual(model.unique_constraints, ())
+        self.assertEqual(model.primary_key.columns, ("ID",))
+        self.assertIsNone(model.primary_key_constraint_name)
+
+
+class UniqueComparisonTests(OfflineTestCase):
+    def setUp(self):
+        super().setUp()
+        self.expected = migrate.validate_create_table(
+            "CREATE TABLE employees (id NUMBER NOT NULL, code VARCHAR2(30 CHAR), "
+            "email VARCHAR2(50 CHAR), CONSTRAINT pk_employees PRIMARY KEY(id), "
+            "CONSTRAINT uq_code UNIQUE(code))")
+        self.actual = migrate.TableColumnMetadata("HR_CORE", "EMPLOYEES", (
+            migrate.OracleColumnMetadata("ID", 1, "NUMBER", None, None, 0, None, "N"),
+            migrate.OracleColumnMetadata("CODE", 2, "VARCHAR2", None, None, 30, "C", "Y"),
+            migrate.OracleColumnMetadata("EMAIL", 3, "VARCHAR2", None, None, 50, "C", "Y")))
+        self.pk = migrate.OraclePrimaryKeyMetadata("HR_CORE", "EMPLOYEES", "PK_EMPLOYEES", ("ID",))
+        self.unique = migrate.OracleConstraintMetadata(
+            "UQ_CODE", "U", "ENABLED", "VALIDATED", "NOT DEFERRABLE", "IMMEDIATE", None, ("CODE",))
+        self.safety = replace(normal_safety(self.actual, self.pk),
+                              constraints=normal_safety(self.actual, self.pk).constraints + (self.unique,))
+
+    def compare(self, constraints=None, expected=None):
+        safety = self.safety if constraints is None else replace(self.safety, constraints=constraints)
+        return migrate.compare_table_structure(expected or self.expected, self.actual, self.pk, safety=safety)
+
+    def test_exact_unique_match_and_nullable_column(self):
+        self.assertTrue(self.compare().matched)
+        self.assertFalse(self.expected.column_definitions[1].explicit_not_null)
+
+    def test_two_unique_constraints_match_independent_of_constraint_order(self):
+        expected = migrate.validate_create_table(self.expected.statement[:-1] + ", CONSTRAINT uq_email UNIQUE(email))")
+        extra = replace(self.unique, constraint_name="UQ_EMAIL", columns=("EMAIL",))
+        self.assertTrue(self.compare((extra,) + self.safety.constraints, expected).matched)
+
+    def test_missing_unique_mismatches(self):
+        self.assertIs(self.compare(self.safety.constraints[:-1]).status, migrate.StructureComparisonStatus.MISMATCH)
+
+    def test_additional_unique_mismatches(self):
+        extra = replace(self.unique, constraint_name="UQ_EMAIL", columns=("EMAIL",))
+        self.assertIs(self.compare(self.safety.constraints + (extra,)).status, migrate.StructureComparisonStatus.MISMATCH)
+
+    def test_wrong_name_column_and_composite_mismatch(self):
+        for unique in (replace(self.unique, constraint_name="OTHER"),
+                       replace(self.unique, columns=("EMAIL",)), replace(self.unique, columns=("CODE", "EMAIL"))):
+            with self.subTest(unique=unique):
+                self.assertIs(self.compare(self.safety.constraints[:-1] + (unique,)).status,
+                              migrate.StructureComparisonStatus.MISMATCH)
+
+    def test_pk_is_not_counted_as_unique(self):
+        self.assertTrue(self.compare().matched)
+        self.assertFalse(self.compare(self.safety.constraints[:-1]).matched)
+
+    def test_incomplete_or_unknown_column_unique_metadata_is_invalid(self):
+        for columns in (None, (), ["CODE"], ("MISSING",), ("CODE", "CODE")):
+            with self.subTest(columns=columns):
+                unique = replace(self.unique, columns=columns)
+                self.assertIs(self.compare(self.safety.constraints[:-1] + (unique,)).status,
+                              migrate.StructureComparisonStatus.INVALID_METADATA)
+
+    def test_unique_must_be_enabled_validated_and_immediate(self):
+        for changes in ({"status": "DISABLED"}, {"validated": "NOT VALIDATED"},
+                        {"deferrable": "DEFERRABLE"}, {"deferred": "DEFERRED"}):
+            with self.subTest(changes=changes):
+                unique = replace(self.unique, **changes)
+                self.assertFalse(self.compare(self.safety.constraints[:-1] + (unique,)).matched)
+
+    def test_tampered_expected_unique_model_is_invalid(self):
+        expected = replace(self.expected, unique_constraints=(migrate.UniqueConstraintDefinition("OTHER", "CODE"),))
+        self.assertIs(self.compare(expected=expected).status, migrate.StructureComparisonStatus.INVALID_EXPECTATION)
+
+
+class UniqueMetadataReaderTests(ConnectionHelperTestCase):
+    """Sentetik dictionary satırları; canlı Oracle davranışının kanıtı değildir."""
+    def setUp(self):
+        super().setUp()
+        self.metadata_cursor = MagicMock()
+        self.metadata_cursor.__enter__.return_value = self.metadata_cursor
+        self.connection.cursor.side_effect = [self.cursor, self.metadata_cursor]
+        self.constraints = [("UQ_CODE", "U", "ENABLED", "VALIDATED", "NOT DEFERRABLE", "IMMEDIATE", None)]
+        self.rows = [("HR_CORE", "EMPLOYEES", "UQ_CODE", "CODE", 1)]
+        self.configure()
+
+    def configure(self):
+        self.connection.cursor.side_effect = [self.cursor, self.metadata_cursor]
+        self.metadata_cursor.fetchall.side_effect = [
+            [("TABLE", "VALID")], [("N", None, "NO", "N")],
+            [("CODE", 1, None, "NO", "NO", "NO", "YES")], self.constraints, self.rows]
+
+    def read(self):
+        return migrate.read_table_safety_metadata(self.connection, "EMPLOYEES")
+
+    def test_unique_query_binds_join_and_immutable_snapshot(self):
+        result = self.read()
+        unique, = result.constraints
+        self.assertEqual(unique.columns, ("CODE",))
+        self.assertEqual(unique.constraint_type, "U")
+        query, params = self.metadata_cursor.execute.call_args_list[-1].args
+        for fragment in ("ALL_CONS_COLUMNS", "ALL_CONSTRAINTS", "u.OWNER = c.OWNER",
+                         "u.TABLE_NAME = c.TABLE_NAME", "u.CONSTRAINT_NAME = c.CONSTRAINT_NAME",
+                         "u.CONSTRAINT_TYPE = 'U'", "ORDER BY c.CONSTRAINT_NAME, c.POSITION"):
+            self.assertIn(fragment, query)
+        self.assertEqual(params, {"owner": "HR_CORE", "table_name": "EMPLOYEES"})
+        self.assertNotIn("EMPLOYEES", query)
+        self.assertNotIn("INDEX", query)
+        with self.assertRaises(FrozenInstanceError):
+            unique.columns = ()
+        self.driver.connect.assert_not_called()
+        self.loader.assert_not_called()
+        for method in (self.connection.commit, self.connection.rollback, self.connection.close):
+            method.assert_not_called()
+
+    def test_real_reader_and_comparator_produce_match_without_pk(self):
+        safety = self.read()
+        expected = migrate.validate_create_table(
+            "CREATE TABLE employees (code NUMBER, CONSTRAINT uq_code UNIQUE(code))")
+        actual = migrate.TableColumnMetadata("HR_CORE", "EMPLOYEES", (
+            migrate.OracleColumnMetadata("CODE", 1, "NUMBER", None, None, 0, None, "Y"),))
+        result = migrate.compare_table_structure(expected, actual, None, safety=safety)
+        self.assertTrue(result.matched)
+        self.assertEqual(self.metadata_cursor.execute.call_count, 5)
+        self.driver.connect.assert_not_called()
+
+    def test_duplicate_unique_identity_in_first_snapshot_is_rejected(self):
+        self.constraints *= 2
+        self.configure()
+        with self.assertRaises(migrate.TableSafetyMetadataReadError):
+            self.read()
+        self.assertEqual(self.metadata_cursor.execute.call_count, 4)
+
+    def test_multiple_unique_column_mappings(self):
+        self.constraints += [("UQ_EMAIL", "U", "ENABLED", "VALIDATED", "NOT DEFERRABLE", "IMMEDIATE", None)]
+        self.rows += [("HR_CORE", "EMPLOYEES", "UQ_EMAIL", "EMAIL", 1)]
+        self.configure()
+        self.assertEqual(tuple(c.columns for c in self.read().constraints), (("CODE",), ("EMAIL",)))
+
+    def test_absent_unique_avoids_extra_query(self):
+        self.constraints = []
+        self.configure()
+        self.assertEqual(self.read().constraints, ())
+        self.assertEqual(self.metadata_cursor.execute.call_count, 4)
+
+    def test_missing_or_malformed_unique_columns_fail_closed(self):
+        for rows in ([], [()], [self.rows[0] + ("EXTRA",)], [None], None):
+            with self.subTest(rows=rows):
+                self.rows = rows
+                self.configure()
+                with self.assertRaises(migrate.TableSafetyMetadataReadError):
+                    self.read()
+
+    def test_wrong_scope_constraint_column_and_position_rejected(self):
+        valid = ("HR_CORE", "EMPLOYEES", "UQ_CODE", "CODE", 1)
+        for index, values in ((0, ("OTHER",)), (1, ("OTHER",)), (2, ("OTHER",)),
+                              (3, (None, "")), (4, (True, None, 0, -1, 2, "1"))):
+            for value in values:
+                row = list(valid)
+                row[index] = value
+                self.rows = [tuple(row)]
+                self.configure()
+                with self.subTest(index=index, value=value), self.assertRaises(migrate.TableSafetyMetadataReadError):
+                    self.read()
+
+    def test_duplicate_gapped_or_unsorted_positions_rejected(self):
+        first = ("HR_CORE", "EMPLOYEES", "UQ_CODE", "CODE", 1)
+        for rows in ([first, first], [first, first[:-2] + ("EMAIL", 3)],
+                     [first[:-2] + ("EMAIL", 2), first], [first, first[:-1] + (2,)]):
+            self.rows = rows
+            self.configure()
+            with self.subTest(rows=rows), self.assertRaises(migrate.TableSafetyMetadataReadError):
+                self.read()
+
+    def test_composite_actual_metadata_is_preserved_for_mismatch(self):
+        self.rows += [("HR_CORE", "EMPLOYEES", "UQ_CODE", "EMAIL", 2)]
+        self.configure()
+        self.assertEqual(self.read().constraints[0].columns, ("CODE", "EMAIL"))
+
+    def test_unique_query_execute_and_fetch_errors_are_safe_and_close_cursor(self):
+        for stage in ("execute", "fetch"):
+            self.configure()
+            self.metadata_cursor.reset_mock()
+            secret = "secret-password-host-raw-sql"
+            if stage == "execute":
+                self.metadata_cursor.execute.side_effect = [None] * 4 + [MockOracleError(secret)]
+            else:
+                self.metadata_cursor.execute.side_effect = None
+                self.metadata_cursor.fetchall.side_effect = list(self.metadata_cursor.fetchall.side_effect)[:4] + [MockOracleError(secret)]
+            with self.subTest(stage=stage), self.assertRaises(migrate.TableSafetyMetadataReadError) as caught:
+                self.read()
+            self.assertNotIn(secret, str(caught.exception))
+            self.metadata_cursor.__exit__.assert_called_once()
+            self.connection.commit.assert_not_called()
+            self.connection.rollback.assert_not_called()
+            self.connection.close.assert_not_called()
+            self.driver.connect.assert_not_called()
+
+
+class UniquePrecheckTests(OfflineTestCase):
+    def setUp(self):
+        super().setUp()
+        self.definition = migrate.validate_create_table(
+            "CREATE TABLE employees (code NUMBER, email NUMBER, "
+            "CONSTRAINT uq_code UNIQUE(code), CONSTRAINT uq_email UNIQUE(email))")
+        self.connection = Mock()
+
+    def test_unique_constraint_names_prechecked_with_owner_binds(self):
+        with patch.object(migrate, "_read_precheck_count", return_value=0) as read:
+            migrate.check_unique_constraint_names_available(self.connection, self.definition)
+        self.assertEqual(read.call_count, 2)
+        self.assertEqual([c.args[2] for c in read.call_args_list], [
+            {"owner": "HR_CORE", "constraint_name": "UQ_CODE"},
+            {"owner": "HR_CORE", "constraint_name": "UQ_EMAIL"}])
+        for item in read.call_args_list:
+            self.assertIs(item.args[0], self.connection)
+            self.assertIn("ALL_CONSTRAINTS", item.args[1])
+            self.assertNotIn("UQ_CODE", item.args[1])
+
+    def test_precondition_order_includes_unique_after_object_and_pk(self):
+        events = []
+        with patch.object(migrate, "check_target_object_available", side_effect=lambda *a: events.append("object")), \
+             patch.object(migrate, "check_primary_key_name_available", side_effect=lambda *a: events.append("pk")), \
+             patch.object(migrate, "check_unique_constraint_names_available", side_effect=lambda *a: events.append("unique")):
+            migrate.validate_create_table_preconditions(self.connection, self.definition)
+        self.assertEqual(events, ["object", "pk", "unique"])
+
+    def test_no_unique_requires_no_query(self):
+        definition = migrate.validate_create_table("CREATE TABLE employees (id NUMBER, PRIMARY KEY(id))")
+        with patch.object(migrate, "_read_precheck_count") as read:
+            migrate.check_unique_constraint_names_available(self.connection, definition)
+        read.assert_not_called()
+
+    def test_precheck_read_failure_is_not_assumed_available(self):
+        with patch.object(migrate, "_read_precheck_count", side_effect=migrate.MetadataPrecheckError("Güvenli hata")) as read:
+            with self.assertRaises(migrate.MetadataPrecheckError):
+                migrate.check_unique_constraint_names_available(self.connection, self.definition)
+        read.assert_called_once()
+
+    def test_collision_stops_without_retry(self):
+        with patch.object(migrate, "_read_precheck_count", return_value=1) as read:
+            with self.assertRaises(migrate.MetadataPrecheckError):
+                migrate.check_unique_constraint_names_available(self.connection, self.definition)
+        read.assert_called_once()
+
+    def test_tampered_unique_model_is_rejected_before_query(self):
+        bad = replace(self.definition, unique_constraints=())
+        with patch.object(migrate, "_read_precheck_count") as read:
+            with self.assertRaises(migrate.MetadataPrecheckError):
+                migrate.check_unique_constraint_names_available(self.connection, bad)
+        read.assert_not_called()
+
+
+# Yalnız bellek içi tasarım örnekleri; migration dosyası veya canlı fixture değildir.
+DEPARTMENT_SQL = """CREATE TABLE DEPARTMENT (
+ID NUMBER(19,0) GENERATED ALWAYS AS IDENTITY,
+DEPARTMENT_CODE VARCHAR2(30 CHAR) NOT NULL,
+DEPARTMENT_NAME VARCHAR2(150 CHAR) NOT NULL,
+IS_ACTIVE NUMBER(1,0) DEFAULT 1 NOT NULL,
+CREATED_AT TIMESTAMP(6) WITH TIME ZONE DEFAULT SYSTIMESTAMP NOT NULL,
+CONSTRAINT PK_DEPARTMENT PRIMARY KEY (ID),
+CONSTRAINT UQ_DEPARTMENT_CODE UNIQUE (DEPARTMENT_CODE),
+CONSTRAINT CK_DEPARTMENT_ACTIVE CHECK (IS_ACTIVE IN (0,1))
+);"""
+EMPLOYEE_SQL = """CREATE TABLE EMPLOYEE (
+ID NUMBER(19,0) GENERATED ALWAYS AS IDENTITY,
+EMPLOYEE_NO VARCHAR2(30 CHAR) NOT NULL,
+FIRST_NAME VARCHAR2(100 CHAR) NOT NULL,
+LAST_NAME VARCHAR2(100 CHAR) NOT NULL,
+EMAIL VARCHAR2(254 CHAR),
+HIRE_DATE DATE NOT NULL,
+DEPARTMENT_ID NUMBER(19,0) NOT NULL,
+IS_ACTIVE NUMBER(1,0) DEFAULT 1 NOT NULL,
+CREATED_AT TIMESTAMP(6) WITH TIME ZONE DEFAULT SYSTIMESTAMP NOT NULL,
+CONSTRAINT PK_EMPLOYEE PRIMARY KEY (ID),
+CONSTRAINT UQ_EMPLOYEE_NO UNIQUE (EMPLOYEE_NO),
+CONSTRAINT FK_EMPLOYEE_DEPARTMENT FOREIGN KEY (DEPARTMENT_ID) REFERENCES DEPARTMENT (ID),
+CONSTRAINT CK_EMPLOYEE_ACTIVE CHECK (IS_ACTIVE IN (0,1))
+);"""
+
+
+def hrms_snapshot(expected):
+    """Sentetik sözleşme örneği; gerçek Oracle metadata davranışı iddiası taşımaz."""
+    columns, properties, constraints = [], [], []
+    pk_columns = expected.primary_key.columns if expected.primary_key else ()
+    for index, column in enumerate(expected.column_definitions, 1):
+        data_type = column.data_type
+        if data_type == "TIMESTAMP":
+            data_type = "TIMESTAMP(6)" + (" WITH TIME ZONE" if column.with_time_zone else "")
+        mandatory = column.explicit_not_null or column.identity or column.name in pk_columns
+        columns.append(migrate.OracleColumnMetadata(column.name, index, data_type,
+            column.number_precision, 6 if column.data_type == "TIMESTAMP" else column.number_scale,
+            column.char_length or 0, "C" if column.char_semantics else None, "N" if mandatory else "Y"))
+        expression = column.default
+        sequence = None
+        if column.identity:
+            sequence = "ISEQ$$_42"
+            expression = '\"HR_CORE\".\"ISEQ$$_42\".nextval'
+        properties.append(migrate.OracleColumnProperties(column.name, index,
+            len(expression) if expression else None, "NO", "NO", "YES" if column.identity else "NO", "YES",
+            expression, "NO" if expression else None, "ALWAYS" if column.identity else None, sequence))
+        if column.explicit_not_null or column.identity:
+            constraints.append(migrate.OracleConstraintMetadata(f"SYS_NN_{index}", "C", "ENABLED", "VALIDATED",
+                "NOT DEFERRABLE", "IMMEDIATE", f'"{column.name}" IS NOT NULL'))
+    pk = None
+    if expected.primary_key:
+        pk = migrate.OraclePrimaryKeyMetadata("HR_CORE", expected.table_name,
+            expected.primary_key.constraint_name or "SYS_PK_42", expected.primary_key.columns)
+        constraints.append(migrate.OracleConstraintMetadata(pk.constraint_name, "P", "ENABLED", "VALIDATED",
+            "NOT DEFERRABLE", "IMMEDIATE", None))
+    for unique in expected.unique_constraints:
+        constraints.append(migrate.OracleConstraintMetadata(unique.constraint_name, "U", "ENABLED", "VALIDATED",
+            "NOT DEFERRABLE", "IMMEDIATE", None, (unique.column_name,)))
+    for check in expected.active_checks:
+        constraints.append(migrate.OracleConstraintMetadata(check.constraint_name, "C", "ENABLED", "VALIDATED",
+            "NOT DEFERRABLE", "IMMEDIATE", '"IS_ACTIVE" IN (0,1)'))
+    for fk in expected.foreign_keys:
+        constraints.append(migrate.OracleConstraintMetadata(fk.constraint_name, "R", "ENABLED", "VALIDATED",
+            "NOT DEFERRABLE", "IMMEDIATE", None, (fk.column_name,),
+            migrate.OracleForeignKeyReference("HR_CORE", fk.referenced_table, "PK_" + fk.referenced_table,
+                "P", (fk.referenced_column,), "NO ACTION", "ENABLED", "VALIDATED")))
+    actual = migrate.TableColumnMetadata("HR_CORE", expected.table_name, tuple(columns))
+    safety = migrate.TableSafetyMetadata("HR_CORE", expected.table_name, (("TABLE", "VALID"),),
+        "N", None, "NO", "N", tuple(properties), tuple(constraints))
+    return actual, pk, safety
+
+
+class HrmsGrammarTests(OfflineTestCase):
+    def test_department_model_has_identity_defaults_check_and_unique(self):
+        model = migrate.validate_create_table(DEPARTMENT_SQL)
+        self.assertTrue(model.column_definitions[0].identity)
+        self.assertFalse(model.column_definitions[0].explicit_not_null)
+        self.assertEqual(model.column_definitions[3].default, "1")
+        self.assertEqual(model.column_definitions[4].default, "SYSTIMESTAMP")
+        self.assertEqual(model.active_checks, (migrate.ActiveCheckDefinition("CK_DEPARTMENT_ACTIVE"),))
+        self.assertEqual(len(model.unique_constraints), 1)
+
+    def test_employee_model_has_single_column_fk_and_nullable_email(self):
+        model = migrate.validate_create_table(EMPLOYEE_SQL)
+        self.assertEqual(model.foreign_keys, (migrate.ForeignKeyDefinition(
+            "FK_EMPLOYEE_DEPARTMENT", "DEPARTMENT_ID", "DEPARTMENT", "ID"),))
+        self.assertFalse(model.column_definitions[4].explicit_not_null)
+        self.assertEqual(len(model.columns), 9)
+
+    def test_explicit_hr_core_reference_normalizes_to_same_target(self):
+        model = migrate.validate_create_table(EMPLOYEE_SQL.replace("REFERENCES DEPARTMENT", "REFERENCES HR_CORE.DEPARTMENT"))
+        self.assertEqual(model.foreign_keys, migrate.validate_create_table(EMPLOYEE_SQL).foreign_keys)
+
+    def test_new_models_are_frozen_and_tuple_based(self):
+        model = migrate.validate_create_table(EMPLOYEE_SQL)
+        self.assertIs(type(model.foreign_keys), tuple)
+        self.assertIs(type(model.active_checks), tuple)
+        for obj, attribute, value in ((model.foreign_keys[0], "referenced_table", "OTHER"),
+                                      (model.active_checks[0], "column_name", "OTHER"),
+                                      (model.column_definitions[0], "identity", False)):
+            with self.subTest(attribute=attribute), self.assertRaises(FrozenInstanceError):
+                setattr(obj, attribute, value)
+
+    def test_foreign_key_options_and_composite_rejected(self):
+        original = "FOREIGN KEY (DEPARTMENT_ID) REFERENCES DEPARTMENT (ID)"
+        for replacement in ("FOREIGN KEY (DEPARTMENT_ID,ID) REFERENCES DEPARTMENT (ID,ID)",
+                            "FOREIGN KEY (DEPARTMENT_ID) REFERENCES DEPARTMENT (ID,DEPARTMENT_CODE)",
+                            original + " ON DELETE CASCADE", original + " DEFERRABLE", original + " DISABLE",
+                            "FOREIGN KEY (DEPARTMENT_ID) REFERENCES OTHER.DEPARTMENT (ID)",
+                            "FOREIGN KEY (DEPARTMENT_ID) REFERENCES DEPARTMENT",
+                            "FOREIGN KEY (MISSING) REFERENCES DEPARTMENT (ID)",
+                            "FOREIGN KEY (DEPARTMENT_ID) REFERENCES SCHEMA_MIGRATIONS (VERSION)"):
+            with self.subTest(replacement=replacement), self.assertRaises(ValueError):
+                migrate.validate_create_table(EMPLOYEE_SQL.replace(original, replacement))
+
+    def test_inline_and_unnamed_foreign_key_rejected(self):
+        for sql in ("CREATE TABLE t (id NUMBER REFERENCES DEPARTMENT(ID))",
+                    "CREATE TABLE t (id NUMBER, FOREIGN KEY(id) REFERENCES DEPARTMENT(ID))"):
+            with self.subTest(sql=sql), self.assertRaises(ValueError):
+                migrate.validate_create_table(sql)
+
+    def test_duplicate_fk_column_and_constraint_name_rejected(self):
+        original = "CONSTRAINT FK_EMPLOYEE_DEPARTMENT FOREIGN KEY (DEPARTMENT_ID) REFERENCES DEPARTMENT (ID)"
+        for extra in (original.replace("FK_EMPLOYEE_DEPARTMENT", "FK_OTHER"),
+                      original.replace("DEPARTMENT_ID", "ID")):
+            with self.subTest(extra=extra), self.assertRaises(ValueError):
+                migrate.validate_create_table(EMPLOYEE_SQL.replace(original, original + ", " + extra))
+
+    def test_check_only_fixed_named_numeric_active_domain(self):
+        original = "CHECK (IS_ACTIVE IN (0,1))"
+        for check in ("CHECK (IS_ACTIVE IN (1,0))", "CHECK (IS_ACTIVE IN (0,2))",
+                      "CHECK (IS_ACTIVE = 1)", "CHECK (ID IN (0,1))", "CHECK (IS_ACTIVE IN ('0','1'))",
+                      "CHECK (IS_ACTIVE IN (0,1) OR 1=1)", original + " NOVALIDATE"):
+            with self.subTest(check=check), self.assertRaises(ValueError):
+                migrate.validate_create_table(DEPARTMENT_SQL.replace(original, check))
+
+    def test_unnamed_duplicate_and_wrong_type_check_rejected(self):
+        for sql in (DEPARTMENT_SQL.replace("CONSTRAINT CK_DEPARTMENT_ACTIVE ", ""),
+                    DEPARTMENT_SQL.replace("NUMBER(1,0)", "NUMBER(2,0)"),
+                    DEPARTMENT_SQL.replace("CONSTRAINT CK_DEPARTMENT_ACTIVE CHECK (IS_ACTIVE IN (0,1))",
+                        "CONSTRAINT CK_DEPARTMENT_ACTIVE CHECK (IS_ACTIVE IN (0,1)), CONSTRAINT CK_OTHER CHECK (IS_ACTIVE IN (0,1))")):
+            with self.subTest(sql=sql), self.assertRaises(ValueError):
+                migrate.validate_create_table(sql)
+
+    def test_default_restricted_to_approved_column_type_and_value(self):
+        for original, replacement in (("DEFAULT 1", "DEFAULT 0"), ("DEFAULT 1", "DEFAULT (1)"),
+                                      ("DEFAULT 1", "DEFAULT ON NULL 1"), ("DEFAULT 1", "DEFAULT '1'"),
+                                      ("DEFAULT SYSTIMESTAMP", "DEFAULT SYSDATE"),
+                                      ("NUMBER(1,0)", "NUMBER(2,0)"),
+                                      ("IS_ACTIVE NUMBER", "FLAG NUMBER"),
+                                      ("CREATED_AT TIMESTAMP", "OTHER_AT TIMESTAMP"),
+                                      ("TIMESTAMP(6) WITH TIME ZONE", "TIMESTAMP(6)")):
+            with self.subTest(replacement=replacement), self.assertRaises(ValueError):
+                migrate.validate_create_table(DEPARTMENT_SQL.replace(original, replacement))
+
+    def test_identity_only_id_number19_always_without_options(self):
+        for original, replacement in (("ID NUMBER(19,0)", "OTHER NUMBER(19,0)"),
+                                      ("ID NUMBER(19,0)", "ID NUMBER(18,0)"),
+                                      ("ID NUMBER(19,0)", "ID NUMBER"),
+                                      ("GENERATED ALWAYS", "GENERATED BY DEFAULT"),
+                                      ("AS IDENTITY", "AS IDENTITY (START WITH 1)"),
+                                      ("AS IDENTITY", "AS IDENTITY DEFAULT 1")):
+            with self.subTest(replacement=replacement), self.assertRaises(ValueError):
+                migrate.validate_create_table(DEPARTMENT_SQL.replace(original, replacement))
+
+    def test_named_constraints_share_one_namespace(self):
+        for name in ("PK_EMPLOYEE", "UQ_EMPLOYEE_NO", "CK_EMPLOYEE_ACTIVE"):
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                migrate.validate_create_table(EMPLOYEE_SQL.replace("FK_EMPLOYEE_DEPARTMENT", name))
+
+    def test_additional_constraint_names_are_prechecked_without_transactions(self):
+        model = migrate.validate_create_table(EMPLOYEE_SQL)
+        connection = Mock()
+        with patch.object(migrate, "_read_precheck_count", return_value=0) as read:
+            migrate.check_unique_constraint_names_available(connection, model)
+        self.assertEqual([c.args[2]["constraint_name"] for c in read.call_args_list],
+                         ["UQ_EMPLOYEE_NO", "FK_EMPLOYEE_DEPARTMENT", "CK_EMPLOYEE_ACTIVE"])
+        for invocation in read.call_args_list:
+            self.assertIs(invocation.args[0], connection)
+            self.assertEqual(invocation.args[2]["owner"], "HR_CORE")
+        connection.commit.assert_not_called()
+        connection.rollback.assert_not_called()
+
+    def test_new_grammar_keeps_single_statement_and_literal_boundary(self):
+        for sql in (DEPARTMENT_SQL + " CREATE TABLE other (id NUMBER);",
+                    DEPARTMENT_SQL.replace("DEFAULT 1", "DEFAULT 1+0"),
+                    EMPLOYEE_SQL.replace("REFERENCES DEPARTMENT", 'REFERENCES "DEPARTMENT"')):
+            with self.subTest(sql=sql), self.assertRaises(ValueError):
+                migrate.validate_create_table(sql)
+
+
+class HrmsMetadataComparisonTests(OfflineTestCase):
+    def setUp(self):
+        super().setUp()
+        self.expected = migrate.validate_create_table(EMPLOYEE_SQL)
+        self.actual, self.pk, self.safety = hrms_snapshot(self.expected)
+
+    def compare(self, safety=None, expected=None):
+        return migrate.compare_table_structure(expected or self.expected, self.actual, self.pk,
+                                               safety=safety if safety is not None else self.safety)
+
+    def mutate_column(self, name, **changes):
+        return replace(self.safety, column_properties=tuple(
+            replace(c, **changes) if c.column_name == name else c for c in self.safety.column_properties))
+
+    def mutate_constraint(self, name, **changes):
+        return replace(self.safety, constraints=tuple(
+            replace(c, **changes) if c.constraint_name == name else c for c in self.safety.constraints))
+
+    def test_complete_employee_and_department_snapshots_match(self):
+        self.assertTrue(self.compare().matched)
+        expected = migrate.validate_create_table(DEPARTMENT_SQL)
+        actual, pk, safety = hrms_snapshot(expected)
+        self.assertTrue(migrate.compare_table_structure(expected, actual, pk, safety=safety).matched)
+
+    def test_wrong_defaults_mismatch(self):
+        for name, value in (("IS_ACTIVE", "0"), ("IS_ACTIVE", "1+0"),
+                            ("CREATED_AT", "SYSDATE"), ("CREATED_AT", "SYSTIMESTAMP AT TIME ZONE 'UTC'")):
+            with self.subTest(name=name, value=value):
+                self.assertIs(self.compare(self.mutate_column(name, default_expression=value)).status,
+                              migrate.StructureComparisonStatus.MISMATCH)
+
+    def test_missing_default_is_mismatch_but_partial_evidence_invalid(self):
+        absent = self.mutate_column("IS_ACTIVE", default_length=None, default_expression=None, default_on_null=None)
+        self.assertIs(self.compare(absent).status, migrate.StructureComparisonStatus.MISMATCH)
+        self.assertIs(self.compare(self.mutate_column("IS_ACTIVE", default_expression=None)).status,
+                      migrate.StructureComparisonStatus.INVALID_METADATA)
+
+    def test_unexpected_default_and_on_null_are_rejected(self):
+        self.assertFalse(self.compare(self.mutate_column("EMAIL", default_length=1,
+            default_expression="1", default_on_null="NO")).matched)
+        self.assertFalse(self.compare(self.mutate_column("IS_ACTIVE", default_on_null="YES")).matched)
+
+    def test_default_keyword_case_and_whitespace_normalization_is_narrow(self):
+        self.assertTrue(self.compare(self.mutate_column("CREATED_AT", default_expression=" systimestamp ")).matched)
+        self.assertTrue(self.compare(self.mutate_column("IS_ACTIVE", default_expression=" 1 ")).matched)
+
+    def test_identity_generation_and_sequence_mismatch(self):
+        for changes in ({"identity_generation": "BY DEFAULT"}, {"identity_sequence": "ISEQ$$_OTHER"},
+                        {"default_expression": '\"OTHER\".\"ISEQ$$_42\".nextval'},
+                        {"default_expression": '\"HR_CORE\".\"ISEQ$$_42\".nextval+1'}):
+            with self.subTest(changes=changes):
+                self.assertFalse(self.compare(self.mutate_column("ID", **changes)).matched)
+
+    def test_identity_sequence_default_conflict_requires_manual_review_not_failed(self):
+        for changes in ({"identity_sequence": "ISEQ$$_OTHER"},
+                        {"default_expression": '\"OTHER\".\"ISEQ$$_42\".nextval'},
+                        {"default_expression": '\"HR_CORE\".\"ISEQ$$_42\".nextval+1'}):
+            with self.subTest(changes=changes):
+                result = self.compare(self.mutate_column("ID", **changes))
+                self.assertIs(result.status, migrate.StructureComparisonStatus.INVALID_METADATA)
+                decision = migrate.classify_execution_outcome(migrate.DDLOutcome.SUCCEEDED,
+                    metadata=result, history_state=migrate.HistoryState.RUNNING_CONFIRMED)
+                self.assertFalse(decision.can_mark_success)
+                self.assertFalse(decision.can_mark_failed)
+                self.assertTrue(decision.manual_review_required)
+
+    def test_identity_partial_evidence_is_invalid(self):
+        for changes in ({"identity_generation": None}, {"identity_sequence": None}, {"default_length": None}):
+            with self.subTest(changes=changes):
+                self.assertIs(self.compare(self.mutate_column("ID", **changes)).status,
+                              migrate.StructureComparisonStatus.INVALID_METADATA)
+
+    def test_identity_not_null_is_implicit_without_setting_explicit_flag(self):
+        self.assertFalse(self.expected.column_definitions[0].explicit_not_null)
+        actual = replace(self.actual, columns=(replace(self.actual.columns[0], nullable="Y"),) + self.actual.columns[1:])
+        self.assertFalse(migrate.compare_table_structure(self.expected, actual, self.pk, safety=self.safety).matched)
+
+    def test_missing_extra_and_wrong_check_are_mismatches(self):
+        name = "CK_EMPLOYEE_ACTIVE"
+        for safety in (replace(self.safety, constraints=tuple(c for c in self.safety.constraints if c.constraint_name != name)),
+                       self.mutate_constraint(name, condition='"IS_ACTIVE" IN (0,2)'),
+                       self.mutate_constraint(name, constraint_name="CK_OTHER")):
+            with self.subTest(safety=safety):
+                self.assertIs(self.compare(safety).status, migrate.StructureComparisonStatus.MISMATCH)
+
+    def test_active_check_normalizer_rejects_expression_and_identifier_injection(self):
+        for text in ('"is_active" IN (0,1)', 'IS_ACTIVE IN (0,1) OR 1=1', "IS_ACTIVE IN ('0','1')",
+                     'IS_ACTIVE IN (0,1);', 'IS_ACTIVE IN (0,1) /* x */', '((IS_ACTIVE IN (0,1))',
+                     'IS_ACTIVE IN (1,0)', 'IS_ACTIVE IN (0,1))'):
+            with self.subTest(text=text):
+                self.assertFalse(migrate._is_active_check(text))
+        for text in ('"IS_ACTIVE" in (0,1)', ' ((IS_ACTIVE IN (0,1))) '):
+            self.assertTrue(migrate._is_active_check(text))
+
+    def test_fk_missing_extra_wrong_name_and_local_column(self):
+        name = "FK_EMPLOYEE_DEPARTMENT"
+        for safety in (replace(self.safety, constraints=tuple(c for c in self.safety.constraints if c.constraint_name != name)),
+                       self.mutate_constraint(name, constraint_name="FK_OTHER"),
+                       self.mutate_constraint(name, columns=("ID",))):
+            with self.subTest(safety=safety):
+                self.assertIs(self.compare(safety).status, migrate.StructureComparisonStatus.MISMATCH)
+
+    def test_fk_target_table_column_type_and_delete_policy(self):
+        fk = next(c for c in self.safety.constraints if c.constraint_type == "R")
+        for changes in ({"table_name": "OTHER"}, {"columns": ("OTHER",)}, {"delete_rule": "CASCADE"},
+                        {"status": "DISABLED"}, {"validated": "NOT VALIDATED"}):
+            with self.subTest(changes=changes):
+                self.assertIs(self.compare(self.mutate_constraint(fk.constraint_name,
+                    reference=replace(fk.reference, **changes))).status, migrate.StructureComparisonStatus.MISMATCH)
+        for changes in ({"owner": "OTHER"}, {"constraint_type": "C"}, {"columns": ()}):
+            self.assertIs(self.compare(self.mutate_constraint(fk.constraint_name,
+                reference=replace(fk.reference, **changes))).status, migrate.StructureComparisonStatus.INVALID_METADATA)
+
+    def test_fk_may_reference_unique_key_without_confusing_index(self):
+        fk = next(c for c in self.safety.constraints if c.constraint_type == "R")
+        self.assertTrue(self.compare(self.mutate_constraint(fk.constraint_name,
+            reference=replace(fk.reference, constraint_type="U", constraint_name="UQ_DEPARTMENT_ID"))).matched)
+
+    def test_missing_fk_reference_is_invalid_not_known_ddl_failure(self):
+        result = self.compare(self.mutate_constraint("FK_EMPLOYEE_DEPARTMENT", reference=None))
+        self.assertIs(result.status, migrate.StructureComparisonStatus.INVALID_METADATA)
+        decision = migrate.classify_execution_outcome(migrate.DDLOutcome.SUCCEEDED, metadata=result,
+            history_state=migrate.HistoryState.RUNNING_CONFIRMED)
+        self.assertFalse(decision.can_mark_failed)
+        self.assertFalse(decision.can_mark_success)
+        self.assertTrue(decision.manual_review_required)
+
+    def test_known_structure_mismatch_retains_existing_failed_policy(self):
+        result = self.compare(self.mutate_constraint("CK_EMPLOYEE_ACTIVE", condition="IS_ACTIVE IN (0,2)"))
+        decision = migrate.classify_execution_outcome(migrate.DDLOutcome.SUCCEEDED, metadata=result,
+            history_state=migrate.HistoryState.RUNNING_CONFIRMED)
+        self.assertEqual(decision.failed_reason, "POST_VALIDATION_FAILED")
+        self.assertTrue(decision.manual_review_required)
+
+    def test_tampered_new_expected_fields_fail_closed(self):
+        for expected in (replace(self.expected, foreign_keys=()), replace(self.expected, active_checks=()),
+                         replace(self.expected, foreign_keys=list(self.expected.foreign_keys)),
+                         replace(self.expected, active_checks=(migrate.ActiveCheckDefinition("OTHER"),))):
+            with self.subTest(expected=expected):
+                self.assertIs(self.compare(expected=expected).status, migrate.StructureComparisonStatus.INVALID_EXPECTATION)
+
+    def test_additional_fk_constraint_cannot_match(self):
+        fk = next(c for c in self.safety.constraints if c.constraint_type == "R")
+        extra = replace(fk, constraint_name="FK_EXTRA")
+        self.assertFalse(self.compare(replace(self.safety, constraints=self.safety.constraints + (extra,))).matched)
+
+    def test_duplicate_constraint_and_partial_reference_are_invalid(self):
+        fk = next(c for c in self.safety.constraints if c.constraint_type == "R")
+        for safety in (replace(self.safety, constraints=self.safety.constraints + (fk,)),
+                       self.mutate_constraint(fk.constraint_name, reference=replace(fk.reference, columns=("ID", "OTHER")))):
+            self.assertIs(self.compare(safety).status, migrate.StructureComparisonStatus.INVALID_METADATA)
+
+    def test_identity_without_pk_still_requires_nonnullable_column(self):
+        expected = migrate.validate_create_table("CREATE TABLE t (id NUMBER(19,0) GENERATED ALWAYS AS IDENTITY)")
+        actual, pk, safety = hrms_snapshot(expected)
+        self.assertTrue(migrate.compare_table_structure(expected, actual, pk, safety=safety).matched)
+        actual = replace(actual, columns=(replace(actual.columns[0], nullable="Y"),))
+        self.assertFalse(migrate.compare_table_structure(expected, actual, pk, safety=safety).matched)
+
+    def test_sensitive_metadata_is_excluded_from_repr(self):
+        marker = "SENSITIVE_EXPRESSION"
+        self.assertNotIn(marker, repr(self.mutate_column("IS_ACTIVE", default_expression=marker)))
+        self.assertNotIn(marker, repr(self.mutate_constraint("CK_EMPLOYEE_ACTIVE", condition=marker)))
+
+
+class HrmsExtendedReaderTests(ConnectionHelperTestCase):
+    def setUp(self):
+        super().setUp()
+        self.expected = migrate.validate_create_table(EMPLOYEE_SQL)
+        self.actual, self.pk, self.safety = hrms_snapshot(self.expected)
+        self.base = MagicMock()
+        self.base.__enter__.return_value = self.base
+        self.fk_cursor = MagicMock()
+        self.fk_cursor.__enter__.return_value = self.fk_cursor
+        self.values_cursor = MagicMock()
+        self.values_cursor.__enter__.return_value = self.values_cursor
+        self.fk_rows = [("HR_CORE", "EMPLOYEE", "FK_EMPLOYEE_DEPARTMENT", "DEPARTMENT_ID", 1,
+            "HR_CORE", "DEPARTMENT", "PK_DEPARTMENT", "P", "ID", 1, "NO ACTION", "ENABLED", "VALIDATED", 1)]
+        self.configure()
+
+    def configure(self):
+        self.connection.cursor.side_effect = [self.cursor, self.base, self.fk_cursor, self.values_cursor]
+        properties = self.safety.column_properties
+        constraints = self.safety.constraints
+        self.base.fetchall.side_effect = [list(self.safety.object_types),
+            [("N", None, "NO", "N")],
+            [(p.column_name, p.column_id, p.default_length, p.hidden, p.virtual, p.identity, p.user_generated) for p in properties],
+            [(c.constraint_name, c.constraint_type, c.status, c.validated, c.deferrable, c.deferred, c.condition) for c in constraints],
+            [("HR_CORE", "EMPLOYEE", "UQ_EMPLOYEE_NO", "EMPLOYEE_NO", 1)]]
+        self.fk_cursor.fetchall.return_value = self.fk_rows
+        self.values_cursor.fetchall.side_effect = [
+            [(p.column_name, p.default_expression, p.default_on_null) for p in properties if p.default_length is not None],
+            [(p.column_name, p.identity_generation, p.identity_sequence) for p in properties if p.identity == "YES"]]
+
+    def read(self):
+        return migrate.read_table_safety_metadata(self.connection, "EMPLOYEE")
+
+    def test_real_readers_and_comparator_work_together_with_synthetic_metadata(self):
+        safety = self.read()
+        result = migrate.compare_table_structure(self.expected, self.actual, self.pk, safety=safety)
+        self.assertTrue(result.matched)
+        self.driver.connect.assert_not_called()
+        self.loader.assert_not_called()
+        for method in (self.connection.commit, self.connection.rollback, self.connection.close):
+            method.assert_not_called()
+        for cursor in (self.base, self.fk_cursor, self.values_cursor):
+            cursor.__exit__.assert_called_once_with(None, None, None)
+
+    def test_extended_queries_are_select_bound_and_schema_limited(self):
+        self.read()
+        for cursor in (self.fk_cursor, self.values_cursor):
+            for invocation in cursor.execute.call_args_list:
+                query, params = invocation.args
+                self.assertTrue(query.startswith("SELECT "))
+                self.assertEqual(params, {"owner": "HR_CORE", "table_name": "EMPLOYEE"})
+                self.assertNotIn("EMPLOYEE", query)
+        fk_query = self.fk_cursor.execute.call_args.args[0]
+        for fragment in ("ALL_CONSTRAINTS", "ALL_CONS_COLUMNS", "r.OWNER=:owner", "rc.POSITION=c.POSITION"):
+            self.assertIn(fragment, fk_query)
+        self.assertIn("DATA_DEFAULT", self.values_cursor.execute.call_args_list[0].args[0])
+        self.assertIn("ALL_TAB_IDENTITY_COLS", self.values_cursor.execute.call_args_list[1].args[0])
+
+    def test_absent_fk_details_are_not_absent_fk(self):
+        self.fk_rows = []
+        self.configure()
+        with self.assertRaises(migrate.TableSafetyMetadataReadError):
+            self.read()
+        self.values_cursor.execute.assert_not_called()
+
+    def test_malformed_fk_rows_scopes_positions_and_references_fail_closed(self):
+        original = self.fk_rows[0]
+        cases = [(), original + ("EXTRA",), None]
+        for index, value in ((0, "OTHER"), (1, "OTHER"), (2, "OTHER"), (4, True), (4, 2),
+                             (5, "OTHER"), (8, "R"), (10, True), (10, 2), (11, "UNKNOWN"),
+                             (14, True), (14, 0), (14, 2)):
+            row = list(original)
+            row[index] = value
+            cases.append(tuple(row))
+        for row in cases:
+            self.fk_rows = [row]
+            self.configure()
+            with self.subTest(row=row), self.assertRaises(migrate.TableSafetyMetadataReadError):
+                self.read()
+
+    def test_duplicate_fk_rows_are_rejected(self):
+        self.fk_rows *= 2
+        self.configure()
+        with self.assertRaises(migrate.TableSafetyMetadataReadError):
+            self.read()
+
+    def test_missing_extra_and_non_string_defaults_fail_closed(self):
+        valid = [(p.column_name, p.default_expression, p.default_on_null)
+                 for p in self.safety.column_properties if p.default_length is not None]
+        class Unreadable:
+            def __str__(self):
+                raise AssertionError("Driver değeri metne çevrilmemeli")
+            def read(self):
+                raise AssertionError("LOB okunmamalı")
+        for rows in ([], valid[:-1], valid + [("OTHER", "1", "NO")],
+                     [("ID", Unreadable(), "NO")], [("ID", None, "NO")], [("ID", "1", "UNKNOWN")],
+                     [("ID", "1")], valid + [valid[0]]):
+            self.configure()
+            self.values_cursor.fetchall.side_effect = [rows, []]
+            with self.subTest(row_count=len(rows)), self.assertRaises(migrate.TableSafetyMetadataReadError):
+                self.read()
+
+    def test_missing_wrong_and_duplicate_identity_rows_fail_closed(self):
+        default_rows = [(p.column_name, p.default_expression, p.default_on_null)
+                        for p in self.safety.column_properties if p.default_length is not None]
+        for rows in ([], [("OTHER", "ALWAYS", "ISEQ$$_42")], [("ID", "UNKNOWN", "ISEQ$$_42")],
+                     [("ID", "ALWAYS", None)], [("ID", "ALWAYS", "bad.sequence")],
+                     [("ID", "ALWAYS")], [("ID", "ALWAYS", "ISEQ$$_42")] * 2):
+            self.configure()
+            self.values_cursor.fetchall.side_effect = [default_rows, rows]
+            with self.subTest(rows=rows), self.assertRaises(migrate.TableSafetyMetadataReadError):
+                self.read()
+
+    def test_extended_execute_fetch_errors_are_sanitized_and_close_cursors(self):
+        secret = "RAW_SQL_PASSWORD_DSN"
+        for target, stage in ((self.fk_cursor, "execute"), (self.fk_cursor, "fetch"),
+                              (self.values_cursor, "execute"), (self.values_cursor, "fetch")):
+            self.configure()
+            self.fk_cursor.execute.side_effect = None
+            self.values_cursor.execute.side_effect = None
+            target.reset_mock()
+            if stage == "execute":
+                target.execute.side_effect = MockOracleError(secret)
+            else:
+                target.fetchall.side_effect = MockOracleError(secret)
+            with self.subTest(stage=stage), self.assertRaises(migrate.TableSafetyMetadataReadError) as error:
+                self.read()
+            self.assertNotIn(secret, str(error.exception))
+            target.__exit__.assert_called_once()
+            self.connection.commit.assert_not_called()
+            self.connection.rollback.assert_not_called()
+            self.connection.close.assert_not_called()
+            self.driver.connect.assert_not_called()
+            self.fk_cursor.fetchall.side_effect = None
+
+    def test_wrong_session_never_enters_extended_readers(self):
+        self.cursor.fetchone.return_value = ("HR_CORE", "FREEPDB1", "OTHER")
+        with self.assertRaises(migrate.TableSafetyMetadataReadError):
+            self.read()
+        for cursor in (self.base, self.fk_cursor, self.values_cursor):
+            cursor.execute.assert_not_called()
+
+
+class HrmsMigrationFileTests(OfflineTestCase):
+    """Repository SQL dosyalarını oku; Oracle veya executor çağrısı yoktur."""
+
+    def prepared(self, version, filename):
+        path = migrate.MIGRATIONS_DIRECTORY / filename
+        content = path.read_bytes()
+        migration = migrate.Migration(version, path, hashlib.sha256(content).hexdigest())
+        prepared = migrate.read_migration_for_apply(migration)
+        self.assertEqual(prepared.content, content)
+        self.assertEqual(prepared.migration.checksum, hashlib.sha256(prepared.content).hexdigest())
+        return prepared
+
+    def test_department_file_matches_approved_model_and_synthetic_metadata(self):
+        prepared = self.prepared(2, "V0002__create_department.sql")
+        self.assertEqual(prepared.definition, migrate.validate_create_table(DEPARTMENT_SQL))
+        actual, pk, safety = hrms_snapshot(prepared.definition)
+        self.assertTrue(migrate.compare_table_structure(prepared.definition, actual, pk, safety=safety).matched)
+
+    def test_employee_file_matches_approved_model_and_synthetic_metadata(self):
+        prepared = self.prepared(3, "V0003__create_employee.sql")
+        self.assertEqual(prepared.definition, migrate.validate_create_table(EMPLOYEE_SQL))
+        actual, pk, safety = hrms_snapshot(prepared.definition)
+        self.assertTrue(migrate.compare_table_structure(prepared.definition, actual, pk, safety=safety).matched)
+        email = next(c for c in prepared.definition.column_definitions if c.name == "EMAIL")
+        self.assertFalse(email.explicit_not_null)
+        self.assertFalse(email.identity)
+        self.assertIsNone(email.default)
+
+    def test_department_precedes_employee_and_constraint_names_do_not_collide(self):
+        department = self.prepared(2, "V0002__create_department.sql")
+        employee = self.prepared(3, "V0003__create_employee.sql")
+        discovered = migrate.collect_migrations(migrate.MIGRATIONS_DIRECTORY)
+        versions = {m.path.name: m.version for m in discovered}
+        self.assertLess(versions[department.migration.path.name], versions[employee.migration.path.name])
+        names = []
+        for definition in (department.definition, employee.definition):
+            names.append(definition.primary_key_constraint_name)
+            names.extend(c.constraint_name for c in (*definition.unique_constraints,
+                         *definition.foreign_keys, *definition.active_checks))
+        self.assertEqual(len(names), len(set(names)))
+        fk, = employee.definition.foreign_keys
+        self.assertEqual(fk.referenced_table, department.definition.table_name)
+        self.assertEqual((fk.referenced_column,), department.definition.primary_key.columns)
 
 
 if __name__ == "__main__":

@@ -284,6 +284,8 @@ class ColumnDefinition:
     timestamp_precision: int | None = None
     with_time_zone: bool = False
     explicit_not_null: bool = False
+    default: str | None = None
+    identity: bool = False
 
 
 @dataclass(frozen=True)
@@ -293,11 +295,36 @@ class PrimaryKeyDefinition:
 
 
 @dataclass(frozen=True)
+class UniqueConstraintDefinition:
+    """Dar gramerde isimli, tablo düzeyinde ve tek kolonlu UNIQUE."""
+
+    constraint_name: str
+    column_name: str
+
+
+@dataclass(frozen=True)
+class ForeignKeyDefinition:
+    constraint_name: str
+    column_name: str
+    referenced_table: str
+    referenced_column: str
+
+
+@dataclass(frozen=True)
+class ActiveCheckDefinition:
+    constraint_name: str
+    column_name: str = "IS_ACTIVE"
+
+
+@dataclass(frozen=True)
 class CreateTableDefinition:
     table_name: str
     column_definitions: tuple[ColumnDefinition, ...]
     statement: str
     primary_key: PrimaryKeyDefinition | None = None
+    unique_constraints: tuple[UniqueConstraintDefinition, ...] = ()
+    foreign_keys: tuple[ForeignKeyDefinition, ...] = ()
+    active_checks: tuple[ActiveCheckDefinition, ...] = ()
 
     @property
     def columns(self) -> tuple[str, ...]:
@@ -362,7 +389,13 @@ def validate_create_table(text: str) -> CreateTableDefinition:
     """Saf ve tam tüketimli dar gramer; Oracle parser'ı veya yetki kontrolü değildir.
 
     CREATE TABLE [HR_CORE.]name (column type [NOT NULL], ...,
-        [CONSTRAINT name] PRIMARY KEY (column, ...))
+        [CONSTRAINT name] PRIMARY KEY (column, ...),
+        CONSTRAINT name UNIQUE (column), ...)
+    Constraint'ler kolonlardan sonra gelir; UNIQUE yalnız isimli ve tek kolonludur.
+    FK yalnız isimli tek kolon ve HR_CORE; CHECK yalnız isimli IS_ACTIVE IN (0,1).
+    DEFAULT yalnız IS_ACTIVE NUMBER(1,0) için 1 veya saat dilimli CREATED_AT için
+    SYSTIMESTAMP; IDENTITY yalnız ID NUMBER(19,0) GENERATED ALWAYS AS IDENTITY.
+    DEFAULT/IDENTITY tipten sonra, NOT NULL'dan önce gelir.
     Tipler: NUMBER[(p[,s])], VARCHAR2(n CHAR), DATE, CLOB,
     TIMESTAMP[(6)] [WITH TIME ZONE]. Başka clause kabul edilmez.
     """
@@ -383,6 +416,7 @@ def validate_create_table(text: str) -> CreateTableDefinition:
         "NUMBER", "VARCHAR2", "DATE", "CLOB", "TIMESTAMP", "WITH", "TIME",
         "ZONE", "CHAR", "DEFAULT", "CHECK", "REFERENCES", "UNIQUE", "FOREIGN",
         "AS", "SELECT", "FROM", "WHERE", "ALTER", "DROP", "TRUNCATE",
+        "GENERATED", "ALWAYS", "IDENTITY", "IN", "SYSTIMESTAMP",
     }
 
     def identifier() -> str:
@@ -422,6 +456,12 @@ def validate_create_table(text: str) -> CreateTableDefinition:
     column_definitions: list[ColumnDefinition] = []
     primary_key: list[str] = []
     primary_key_constraint_name: str | None = None
+    unique_constraints: list[UniqueConstraintDefinition] = []
+    constraint_names: set[str] = set()
+    unique_columns: set[str] = set()
+    foreign_keys: list[ForeignKeyDefinition] = []
+    active_checks: list[ActiveCheckDefinition] = []
+    foreign_columns: set[str] = set()
     while True:
         column = identifier()
         if column in columns:
@@ -470,6 +510,24 @@ def validate_create_table(text: str) -> CreateTableDefinition:
                 with_time_zone = True
         else:
             raise ValueError("Desteklenmeyen kolon veri tipi.")
+        default = None
+        identity = False
+        if peek() == "GENERATED":
+            if column != "ID" or kind != "NUMBER" or number_precision != 19 or number_scale != 0:
+                raise ValueError("IDENTITY yalnız ID NUMBER(19,0) için desteklenir.")
+            for token in ("GENERATED", "ALWAYS", "AS", "IDENTITY"):
+                take(token)
+            identity = True
+        elif peek() == "DEFAULT":
+            take("DEFAULT")
+            if column == "IS_ACTIVE" and kind == "NUMBER" and number_precision == 1 and number_scale == 0:
+                take("1")
+                default = "1"
+            elif column == "CREATED_AT" and kind == "TIMESTAMP" and with_time_zone:
+                take("SYSTIMESTAMP")
+                default = "SYSTIMESTAMP"
+            else:
+                raise ValueError("DEFAULT yalnız IS_ACTIVE NUMBER(1,0)=1 veya CREATED_AT saat dilimli TIMESTAMP=SYSTIMESTAMP olabilir.")
         if peek() == "NOT":
             take("NOT")
             take("NULL")
@@ -484,22 +542,76 @@ def validate_create_table(text: str) -> CreateTableDefinition:
             timestamp_precision=timestamp_precision,
             with_time_zone=with_time_zone,
             explicit_not_null=explicit_not_null,
+            default=default, identity=identity,
         ))
         if peek() != ",":
             break
         take(",")
         if peek() in {"CONSTRAINT", "PRIMARY"}:
-            if peek() == "CONSTRAINT":
-                take("CONSTRAINT")
-                primary_key_constraint_name = identifier()
-            take("PRIMARY")
-            take("KEY")
-            take("(")
-            primary_key.append(identifier())
-            while peek() == ",":
+            while True:
+                constraint_name = None
+                if peek() == "CONSTRAINT":
+                    take("CONSTRAINT")
+                    constraint_name = identifier()
+                    if constraint_name in constraint_names:
+                        raise ValueError("Tablo içinde constraint adı tekrarlanamaz.")
+                    constraint_names.add(constraint_name)
+                if peek() == "PRIMARY":
+                    if primary_key:
+                        raise ValueError("Bir tabloda yalnızca tek primary key desteklenir.")
+                    primary_key_constraint_name = constraint_name
+                    take("PRIMARY")
+                    take("KEY")
+                    take("(")
+                    primary_key.append(identifier())
+                    while peek() == ",":
+                        take(",")
+                        primary_key.append(identifier())
+                    take(")")
+                elif peek() == "UNIQUE" and constraint_name is not None:
+                    take("UNIQUE")
+                    take("(")
+                    unique_column = identifier()
+                    take(")")  # Virgül/composite, ifade ve seçenek kabul edilmez.
+                    if unique_column not in columns or unique_column in unique_columns:
+                        raise ValueError("UNIQUE kolonu tabloda bulunmalı ve UNIQUE tanımı tekrarlanmamalıdır.")
+                    unique_columns.add(unique_column)
+                    unique_constraints.append(UniqueConstraintDefinition(constraint_name, unique_column))
+                elif peek() == "FOREIGN" and constraint_name is not None:
+                    take("FOREIGN")
+                    take("KEY")
+                    take("(")
+                    local_column = identifier()
+                    take(")")
+                    take("REFERENCES")
+                    ref_table = identifier()
+                    if peek() == ".":
+                        if ref_table != "HR_CORE":
+                            raise ValueError("FK yalnız HR_CORE içindeki tabloları hedefleyebilir.")
+                        take(".")
+                        ref_table = identifier()
+                    if ref_table == "SCHEMA_MIGRATIONS":
+                        raise ValueError("Migration geçmişine FK tanımlanamaz.")
+                    take("(")
+                    ref_column = identifier()
+                    take(")")
+                    if local_column not in columns or local_column in foreign_columns:
+                        raise ValueError("FK kolonu tabloda bulunmalı ve yinelenmemelidir.")
+                    foreign_columns.add(local_column)
+                    foreign_keys.append(ForeignKeyDefinition(constraint_name, local_column, ref_table, ref_column))
+                elif peek() == "CHECK" and constraint_name is not None:
+                    for token in ("CHECK", "(", "IS_ACTIVE", "IN", "(", "0", ",", "1", ")", ")"):
+                        take(token)
+                    active_column = next((c for c in column_definitions if c.name == "IS_ACTIVE"), None)
+                    if (active_checks or active_column is None or active_column.data_type != "NUMBER"
+                        or active_column.number_precision != 1 or active_column.number_scale != 0):
+                        raise ValueError("CHECK yalnız IS_ACTIVE NUMBER(1,0) IN (0,1) için desteklenir.")
+                    active_checks.append(ActiveCheckDefinition(constraint_name))
+                else:
+                    raise ValueError("Desteklenmeyen tablo constraint biçimi.")
+                if peek() != ",":
+                    break
                 take(",")
-                primary_key.append(identifier())
-            take(")")
             break
     take(")")
     if position != len(tokens):
@@ -514,6 +626,8 @@ def validate_create_table(text: str) -> CreateTableDefinition:
             PrimaryKeyDefinition(tuple(primary_key), primary_key_constraint_name)
             if primary_key else None
         ),
+        unique_constraints=tuple(unique_constraints),
+        foreign_keys=tuple(foreign_keys), active_checks=tuple(active_checks),
     )
 
 
@@ -529,6 +643,13 @@ def _validate_precheck_definition(definition: CreateTableDefinition) -> None:
             definition.table_name == validated.table_name
             and definition.column_definitions == validated.column_definitions
             and definition.primary_key == validated.primary_key
+            and type(definition.unique_constraints) is tuple
+            and all(type(unique) is UniqueConstraintDefinition for unique in definition.unique_constraints)
+            and definition.unique_constraints == validated.unique_constraints
+            and type(definition.foreign_keys) is tuple and definition.foreign_keys == validated.foreign_keys
+            and all(type(fk) is ForeignKeyDefinition for fk in definition.foreign_keys)
+            and type(definition.active_checks) is tuple and definition.active_checks == validated.active_checks
+            and all(type(check) is ActiveCheckDefinition for check in definition.active_checks)
         )
     except Exception:
         raise MetadataPrecheckError("Metadata ön kontrolü için doğrulanmış CREATE TABLE modeli gerekir.") from None
@@ -595,10 +716,25 @@ def check_primary_key_name_available(connection, definition: CreateTableDefiniti
         raise MetadataPrecheckError("HR_CORE içinde belirtilen primary key constraint adı zaten kullanılıyor.")
 
 
+def check_unique_constraint_names_available(connection, definition: CreateTableDefinition) -> None:
+    """Uyumlu API: UNIQUE/FK/CHECK açık adlarını şema çapında kontrol et; rezerve etmez."""
+    _validate_precheck_definition(definition)
+    for unique in (*definition.unique_constraints, *definition.foreign_keys, *definition.active_checks):
+        count = _read_precheck_count(
+            connection,
+            "SELECT COUNT(*) FROM ALL_CONSTRAINTS "
+            "WHERE OWNER = :owner AND CONSTRAINT_NAME = :constraint_name",
+            {"owner": "HR_CORE", "constraint_name": unique.constraint_name},
+        )
+        if count:
+            raise MetadataPrecheckError("HR_CORE içinde belirtilen constraint adı zaten kullanılıyor.")
+
+
 def validate_create_table_preconditions(connection, definition: CreateTableDefinition) -> None:
-    """Mevcut bağlantıyla salt okunur ön kontroller; CLI veya apply akışına bağlı değil."""
+    """Mevcut bağlantıyla salt okunur ön kontroller; transaction yönetmez."""
     check_target_object_available(connection, definition)
     check_primary_key_name_available(connection, definition)
+    check_unique_constraint_names_available(connection, definition)
 
 
 @dataclass(frozen=True)
@@ -830,6 +966,22 @@ class OracleColumnProperties:
     virtual: str
     identity: str
     user_generated: str
+    default_expression: str | None = field(default=None, repr=False)
+    default_on_null: str | None = None
+    identity_generation: str | None = None
+    identity_sequence: str | None = field(default=None, repr=False)
+
+
+@dataclass(frozen=True)
+class OracleForeignKeyReference:
+    owner: str
+    table_name: str
+    constraint_name: str
+    constraint_type: str
+    columns: tuple[str, ...]
+    delete_rule: str
+    status: str
+    validated: str
 
 
 @dataclass(frozen=True)
@@ -842,6 +994,9 @@ class OracleConstraintMetadata:
     deferred: str
     # CHECK metni repr/log çıktısına taşınmaz.
     condition: str | None = field(repr=False)
+    # None: bu türe ait kolon görüntüsü yok; U için eksik bilgi MATCH olamaz.
+    columns: tuple[str, ...] | None = None
+    reference: OracleForeignKeyReference | None = None
 
 
 @dataclass(frozen=True)
@@ -891,6 +1046,24 @@ def _validate_table_safety_metadata(metadata: TableSafetyMetadata) -> None:
             or any(value not in ("YES", "NO") for value in
                    (column.hidden, column.virtual, column.identity, column.user_generated))):
             raise TableSafetyMetadataReadError("Kolon özellik metadata sonucu geçersiz.")
+        if column.default_length is not None:
+            if (type(column.default_expression) is not str or not column.default_expression.strip()
+                or len(column.default_expression) > 4000 or column.default_on_null not in ("YES", "NO")):
+                raise TableSafetyMetadataReadError("DEFAULT metadata görüntüsü eksik veya bozuk.")
+        elif column.default_expression is not None or column.default_on_null is not None:
+            raise TableSafetyMetadataReadError("DEFAULT metadata görüntüleri çelişiyor.")
+        if column.identity == "YES":
+            if (column.identity_generation not in ("ALWAYS", "BY DEFAULT")
+                or type(column.identity_sequence) is not str
+                or re.fullmatch(r"[A-Z][A-Z0-9_$#]{0,127}", column.identity_sequence) is None
+                or column.default_length is None):
+                raise TableSafetyMetadataReadError("IDENTITY metadata görüntüsü eksik veya bozuk.")
+            # Ayrı dictionary görüntüleri aynı sequence'i göstermelidir. Bu
+            # çelişki beklenen SQL'e karşı kesin fark veya FAILED kanıtı değildir.
+            if not _identity_default_matches(column):
+                raise TableSafetyMetadataReadError("IDENTITY sequence ve DEFAULT görüntüleri çelişiyor.")
+        elif column.identity_generation is not None or column.identity_sequence is not None:
+            raise TableSafetyMetadataReadError("IDENTITY metadata görüntüleri çelişiyor.")
         if column.column_id is not None:
             if column.column_id <= previous_id:
                 raise TableSafetyMetadataReadError("Kolon özellik sırası geçersiz.")
@@ -911,14 +1084,229 @@ def _validate_table_safety_metadata(metadata: TableSafetyMetadata) -> None:
             or (constraint.constraint_type == "C" and not constraint.condition)
             or (constraint.constraint_type != "C" and constraint.condition is not None)):
             raise TableSafetyMetadataReadError("Constraint metadata sonucu geçersiz.")
+        if constraint.constraint_type in ("U", "R"):
+            if (type(constraint.columns) is not tuple or not constraint.columns
+                or any(not _valid_pk_metadata_name(name) for name in constraint.columns)
+                or len(set(constraint.columns)) != len(constraint.columns)):
+                raise TableSafetyMetadataReadError("Constraint kolon metadata bilgisi eksik veya bozuk.")
+        elif constraint.columns is not None:
+            raise TableSafetyMetadataReadError("Constraint türü ile kolon metadata bilgisi çelişiyor.")
+        if constraint.constraint_type == "R":
+            ref = constraint.reference
+            if (type(ref) is not OracleForeignKeyReference or ref.owner != "HR_CORE"
+                or not _valid_pk_metadata_name(ref.table_name) or not _valid_pk_metadata_name(ref.constraint_name)
+                or ref.constraint_type not in ("P", "U") or type(ref.columns) is not tuple
+                or len(ref.columns) != len(constraint.columns) or not ref.columns
+                or any(not _valid_pk_metadata_name(c) for c in ref.columns)
+                or len(set(ref.columns)) != len(ref.columns)
+                or ref.delete_rule not in ("NO ACTION", "CASCADE", "SET NULL")
+                or ref.status not in ("ENABLED", "DISABLED") or ref.validated not in ("VALIDATED", "NOT VALIDATED")):
+                raise TableSafetyMetadataReadError("FK referans metadata bilgisi eksik veya bozuk.")
+        elif constraint.reference is not None:
+            raise TableSafetyMetadataReadError("Constraint türü ile referans metadata bilgisi çelişiyor.")
         names.add(constraint.constraint_name)
+
+
+def _parse_unique_constraint_columns(rows, table_name: str, names: set[str]) -> dict[str, tuple[str, ...]]:
+    """U kayıtlarının tam kolon eşlemesi; eksik/ek kapsam ve POSITION hataları reddedilir."""
+    if not isinstance(rows, (tuple, list)):
+        raise TableSafetyMetadataReadError("UNIQUE kolon metadata sonucu geçersiz.")
+    grouped: dict[str, list[str]] = {name: [] for name in names}
+    previous_key = None
+    for row in rows:
+        if not isinstance(row, (tuple, list)) or len(row) != 5:
+            raise TableSafetyMetadataReadError("UNIQUE kolon metadata satırı bozuk.")
+        owner, actual_table, constraint, column, position = row
+        if (owner != "HR_CORE" or actual_table != table_name or not _valid_pk_metadata_name(constraint)
+            or constraint not in grouped or not _valid_pk_metadata_name(column)
+            or type(position) is not int or position < 1):
+            raise TableSafetyMetadataReadError("UNIQUE kolon kapsamı veya POSITION geçersiz.")
+        key = (constraint, position)
+        if previous_key is not None and key <= previous_key:
+            raise TableSafetyMetadataReadError("UNIQUE kolon metadata sırası veya benzersizliği geçersiz.")
+        columns = grouped[constraint]
+        if position != len(columns) + 1 or column in columns:
+            raise TableSafetyMetadataReadError("UNIQUE kolon POSITION sırası veya kolonları tutarsız.")
+        columns.append(column)
+        previous_key = key
+    if any(not columns for columns in grouped.values()):
+        raise TableSafetyMetadataReadError("UNIQUE mevcut ancak kolon metadata bilgisi eksik.")
+    return {name: tuple(columns) for name, columns in grouped.items()}
+
+
+def _read_foreign_key_metadata(connection, table_name: str, constraints: tuple) -> tuple:
+    """Yalnız HR_CORE kaynak/hedef; eksik join satırı FK yokluğu sayılmaz."""
+    names = {c.constraint_name for c in constraints if c.constraint_type == "R"}
+    if not names:
+        return constraints
+    if any(not _valid_pk_metadata_name(name) for name in names):
+        raise TableSafetyMetadataReadError("FK constraint kimliği geçersiz.")
+    with connection.cursor() as cursor:
+        cursor.execute(
+            "SELECT c.OWNER, c.TABLE_NAME, c.CONSTRAINT_NAME, c.COLUMN_NAME, c.POSITION, "
+            "r.OWNER, r.TABLE_NAME, r.CONSTRAINT_NAME, r.CONSTRAINT_TYPE, rc.COLUMN_NAME, "
+            "rc.POSITION, f.DELETE_RULE, r.STATUS, r.VALIDATED, "
+            "(SELECT COUNT(*) FROM ALL_CONS_COLUMNS k WHERE k.OWNER=r.OWNER "
+            "AND k.TABLE_NAME=r.TABLE_NAME AND k.CONSTRAINT_NAME=r.CONSTRAINT_NAME) "
+            "FROM ALL_CONSTRAINTS f JOIN ALL_CONS_COLUMNS c "
+            "ON c.OWNER=f.OWNER AND c.TABLE_NAME=f.TABLE_NAME AND c.CONSTRAINT_NAME=f.CONSTRAINT_NAME "
+            "JOIN ALL_CONSTRAINTS r ON r.OWNER=f.R_OWNER AND r.CONSTRAINT_NAME=f.R_CONSTRAINT_NAME "
+            "JOIN ALL_CONS_COLUMNS rc ON rc.OWNER=r.OWNER AND rc.TABLE_NAME=r.TABLE_NAME "
+            "AND rc.CONSTRAINT_NAME=r.CONSTRAINT_NAME AND rc.POSITION=c.POSITION "
+            "WHERE f.OWNER=:owner AND f.TABLE_NAME=:table_name AND f.CONSTRAINT_TYPE='R' "
+            "AND r.OWNER=:owner ORDER BY c.CONSTRAINT_NAME, c.POSITION",
+            {"owner": "HR_CORE", "table_name": table_name})
+        rows = cursor.fetchall()
+    if not isinstance(rows, (list, tuple)):
+        raise TableSafetyMetadataReadError("FK metadata sonucu bozuk.")
+    groups = {name: [] for name in names}
+    references = {}
+    previous = None
+    for row in rows:
+        if not isinstance(row, (list, tuple)) or len(row) != 15:
+            raise TableSafetyMetadataReadError("FK metadata satırı bozuk.")
+        owner, table, name, column, pos, ro, rt, rn, kind, rcol, rpos, rule, status, validated, ref_count = row
+        if (owner != "HR_CORE" or table != table_name or name not in groups
+            or ro != "HR_CORE" or kind not in ("P", "U")
+            or any(not _valid_pk_metadata_name(v) for v in (column, rt, rn, rcol))
+            or type(pos) is not int or type(rpos) is not int or pos != rpos or pos < 1
+            or type(ref_count) is not int or ref_count < 1
+            or pos != len(groups[name]) + 1 or column in groups[name]
+            or rule not in ("NO ACTION", "CASCADE", "SET NULL")
+            or status not in ("ENABLED", "DISABLED") or validated not in ("VALIDATED", "NOT VALIDATED")):
+            raise TableSafetyMetadataReadError("FK metadata kapsamı veya sırası tutarsız.")
+        key = (name, pos)
+        if previous is not None and key <= previous:
+            raise TableSafetyMetadataReadError("FK metadata sırası tutarsız.")
+        previous = key
+        ref = (ro, rt, rn, kind, rule, status, validated, ref_count)
+        if name in references and references[name][0] != ref:
+            raise TableSafetyMetadataReadError("FK referans görüntüsü çelişkili.")
+        if name not in references:
+            references[name] = (ref, [])
+        if rcol in references[name][1]:
+            raise TableSafetyMetadataReadError("FK referans kolonu yineleniyor.")
+        groups[name].append(column)
+        references[name][1].append(rcol)
+    if any(not group for group in groups.values()):
+        raise TableSafetyMetadataReadError("FK mevcut ancak referans kolon metadata bilgisi eksik.")
+    result = []
+    for constraint in constraints:
+        if constraint.constraint_type == "R":
+            ref, columns = references[constraint.constraint_name]
+            ro, rt, rn, kind, rule, status, validated, ref_count = ref
+            if ref_count != len(columns):
+                raise TableSafetyMetadataReadError("FK referans anahtarının kolon görüntüsü eksik.")
+            constraint = replace(constraint, columns=tuple(groups[constraint.constraint_name]),
+                reference=OracleForeignKeyReference(ro, rt, rn, kind, tuple(columns), rule, status, validated))
+        result.append(constraint)
+    return tuple(result)
+
+
+def _read_column_value_metadata(connection, table_name: str, properties: tuple) -> tuple:
+    """DEFAULT LONG yalnız str olarak alınır; LOB.read veya str(driver_value) yok.
+
+    İç sequence adı ALL_TAB_IDENTITY_COLS ile eşleştirilir; salt SYS_ adı
+    IDENTITY kanıtı değildir. Bu yeni dictionary biçimleri canlı doğrulanmalıdır.
+    """
+    defaults = {p.column_name for p in properties if p.default_length is not None}
+    identities = {p.column_name for p in properties if p.identity == "YES"}
+    if not defaults and not identities:
+        return properties
+    params = {"owner": "HR_CORE", "table_name": table_name}
+    values = {}
+    identity_values = {}
+    with connection.cursor() as cursor:
+        if defaults:
+            cursor.execute(
+                "SELECT COLUMN_NAME, DATA_DEFAULT, DEFAULT_ON_NULL FROM ALL_TAB_COLUMNS "
+                "WHERE OWNER=:owner AND TABLE_NAME=:table_name AND DEFAULT_LENGTH IS NOT NULL "
+                "ORDER BY COLUMN_ID", params)
+            rows = cursor.fetchall()
+            if not isinstance(rows, (tuple, list)):
+                raise TableSafetyMetadataReadError("DEFAULT metadata sonucu bozuk.")
+            for row in rows:
+                if not isinstance(row, (tuple, list)) or len(row) != 3:
+                    raise TableSafetyMetadataReadError("DEFAULT metadata satırı bozuk.")
+                name, expression, on_null = row
+                if (name not in defaults or name in values or type(expression) is not str
+                    or not expression.strip() or len(expression) > 4000 or on_null not in ("YES", "NO")):
+                    raise TableSafetyMetadataReadError("DEFAULT metadata eksik veya çelişkili.")
+                values[name] = (expression, on_null)
+            if set(values) != defaults:
+                raise TableSafetyMetadataReadError("DEFAULT kolon görüntüleri çelişiyor.")
+        if identities:
+            cursor.execute(
+                "SELECT COLUMN_NAME, GENERATION_TYPE, SEQUENCE_NAME FROM ALL_TAB_IDENTITY_COLS "
+                "WHERE OWNER=:owner AND TABLE_NAME=:table_name ORDER BY COLUMN_NAME", params)
+            rows = cursor.fetchall()
+            if not isinstance(rows, (tuple, list)):
+                raise TableSafetyMetadataReadError("IDENTITY metadata sonucu bozuk.")
+            for row in rows:
+                if not isinstance(row, (tuple, list)) or len(row) != 3:
+                    raise TableSafetyMetadataReadError("IDENTITY metadata satırı bozuk.")
+                name, generation, sequence = row
+                if (name not in identities or name in identity_values
+                    or generation not in ("ALWAYS", "BY DEFAULT") or type(sequence) is not str
+                    or re.fullmatch(r"[A-Z][A-Z0-9_$#]{0,127}", sequence) is None):
+                    raise TableSafetyMetadataReadError("IDENTITY metadata eksik veya çelişkili.")
+                identity_values[name] = (generation, sequence)
+            if set(identity_values) != identities:
+                raise TableSafetyMetadataReadError("IDENTITY kolon görüntüleri çelişiyor.")
+    return tuple(replace(p,
+        default_expression=values.get(p.column_name, (None, None))[0],
+        default_on_null=values.get(p.column_name, (None, None))[1],
+        identity_generation=identity_values.get(p.column_name, (None, None))[0],
+        identity_sequence=identity_values.get(p.column_name, (None, None))[1]) for p in properties)
+
+
+def _normalized_default(expression: str | None) -> str | None:
+    if type(expression) is not str:
+        return None
+    value = expression.strip()
+    if value == "1":
+        return "1"
+    if value.upper() == "SYSTIMESTAMP":
+        return "SYSTIMESTAMP"
+    return None
+
+
+def _identity_default_matches(column: OracleColumnProperties) -> bool:
+    if type(column.default_expression) is not str or type(column.identity_sequence) is not str:
+        return False
+    # Quoted sequence ve owner büyük/küçük harfi korunur; yalnız NEXTVAL keyword'ü case-insensitive.
+    text = column.default_expression.strip()
+    sequence = re.escape(column.identity_sequence)
+    return re.fullmatch(r'(?:"HR_CORE"\."' + sequence + r'"|HR_CORE\.' + sequence + r')\.(?i:NEXTVAL)', text) is not None
+
+
+def _is_active_check(condition: str | None) -> bool:
+    """Sadece sabit IS_ACTIVE IN (0,1); literal, OR, ek ifade ve tırnak case-fold yok."""
+    if type(condition) is not str or len(condition) > 1000:
+        return False
+    # Mevcut NOT NULL okuyucusu gibi dengeli güvenli dış parantezler dışında normalizasyon yok.
+    text = condition.strip()
+    while text.startswith("(") and text.endswith(")"):
+        depth = 0
+        closes_at_end = True
+        for index, ch in enumerate(text):
+            depth += (ch == "(") - (ch == ")")
+            if depth == 0 and index != len(text) - 1:
+                closes_at_end = False
+                break
+            if depth < 0:
+                return False
+        if not closes_at_end or depth != 0:
+            break
+        text = text[1:-1].strip()
+    return re.fullmatch(r'(?:IS_ACTIVE|"IS_ACTIVE")\s+(?i:IN)\s*\(\s*0\s*,\s*1\s*\)', text) is not None
 
 
 def read_table_safety_metadata(connection, table_name: str) -> TableSafetyMetadata:
     """Aynı bağlantıda SELECT; transaction sahibi değildir, atomik görüntü sağlamaz.
 
-    DATA_DEFAULT (LONG/CLOB) hiç seçilmez veya okunmaz: DEFAULT_LENGTH varlığı
-    yeterlidir; driver LOB nesnesi metne çevrilmez. Bilinmeyen türler fail-closed.
+    DEFAULT varsa DATA_DEFAULT (LONG) kontrollü ek SELECT ile yalnız str olarak
+    okunur; ifade çalıştırılmaz, LOB nesnesi okunmaz veya metne çevrilmez. Bilinmeyen türler fail-closed.
     İç kolon ve dictionary bayrakları gerçek 26ai üzerinde ayrıca doğrulanmalıdır.
     """
     if not isinstance(table_name, str) or re.fullmatch(r"[A-Z][A-Z0-9_]{0,29}", table_name) is None:
@@ -948,16 +1336,37 @@ def read_table_safety_metadata(connection, table_name: str) -> TableSafetyMetada
                 "DEFERRABLE, DEFERRED, SEARCH_CONDITION_VC FROM ALL_CONSTRAINTS "
                 "WHERE OWNER = :owner AND TABLE_NAME = :table_name ORDER BY CONSTRAINT_NAME", params)
             constraints = cursor.fetchall()
+            if (not isinstance(constraints, (tuple, list))
+                or any(not isinstance(row, (tuple, list)) or len(row) != 7 for row in constraints)):
+                raise TableSafetyMetadataReadError("Constraint metadata satırları bozuk.")
+            models = tuple(OracleConstraintMetadata(*row) for row in constraints)
+            unique_names = {c.constraint_name for c in models if c.constraint_type == "U"}
+            if unique_names:
+                if (any(not _valid_pk_metadata_name(name) for name in unique_names)
+                    or len(unique_names) != sum(c.constraint_type == "U" for c in models)):
+                    raise TableSafetyMetadataReadError("UNIQUE constraint kimlikleri geçersiz.")
+                cursor.execute(
+                    "SELECT c.OWNER, c.TABLE_NAME, c.CONSTRAINT_NAME, c.COLUMN_NAME, c.POSITION "
+                    "FROM ALL_CONS_COLUMNS c JOIN ALL_CONSTRAINTS u "
+                    "ON u.OWNER = c.OWNER AND u.CONSTRAINT_NAME = c.CONSTRAINT_NAME "
+                    "AND u.TABLE_NAME = c.TABLE_NAME "
+                    "WHERE u.OWNER = :owner AND u.TABLE_NAME = :table_name "
+                    "AND u.CONSTRAINT_TYPE = 'U' ORDER BY c.CONSTRAINT_NAME, c.POSITION", params)
+                unique_columns = _parse_unique_constraint_columns(cursor.fetchall(), table_name, unique_names)
+                models = tuple(replace(c, columns=unique_columns[c.constraint_name])
+                               if c.constraint_type == "U" else c for c in models)
         if (not isinstance(objects, (tuple, list)) or not isinstance(tables, (tuple, list))
             or len(tables) != 1 or not isinstance(tables[0], (tuple, list)) or len(tables[0]) != 4
             or not isinstance(properties, (tuple, list)) or not isinstance(constraints, (tuple, list))
             or any(not isinstance(row, (tuple, list)) or len(row) != 7 for row in properties)
             or any(not isinstance(row, (tuple, list)) or len(row) != 7 for row in constraints)):
             raise TableSafetyMetadataReadError("Tablo güvenlik metadata satırları eksik veya bozuk.")
+        models = _read_foreign_key_metadata(connection, table_name, models)
+        column_properties = _read_column_value_metadata(
+            connection, table_name, tuple(OracleColumnProperties(*row) for row in properties))
         metadata = TableSafetyMetadata(
             "HR_CORE", table_name, tuple(tuple(row) for row in objects), *tables[0],
-            tuple(OracleColumnProperties(*row) for row in properties),
-            tuple(OracleConstraintMetadata(*row) for row in constraints))
+            column_properties, models)
         _validate_table_safety_metadata(metadata)
         return metadata
     except TableSafetyMetadataReadError:
@@ -1042,7 +1451,14 @@ def compare_table_structure(
         if type(expected) is not CreateTableDefinition or type(expected.column_definitions) is not tuple:
             raise ValueError
         canonical = validate_create_table(expected.statement)
-        if expected.table_name != canonical.table_name or expected.primary_key != canonical.primary_key:
+        if (expected.table_name != canonical.table_name or expected.primary_key != canonical.primary_key
+            or type(expected.unique_constraints) is not tuple
+            or expected.unique_constraints != canonical.unique_constraints
+            or any(type(unique) is not UniqueConstraintDefinition for unique in expected.unique_constraints)
+            or type(expected.foreign_keys) is not tuple or expected.foreign_keys != canonical.foreign_keys
+            or any(type(fk) is not ForeignKeyDefinition for fk in expected.foreign_keys)
+            or type(expected.active_checks) is not tuple or expected.active_checks != canonical.active_checks
+            or any(type(c) is not ActiveCheckDefinition for c in expected.active_checks)):
             raise ValueError
         if len(expected.column_definitions) != len(canonical.column_definitions):
             raise ValueError
@@ -1089,6 +1505,9 @@ def compare_table_structure(
                 column.char_used, column.nullable,
             ))
         _parse_column_metadata_rows(rows)
+        column_names = {column.column_name for column in actual.columns}
+        if any(not set(c.columns).issubset(column_names) for c in safety.constraints if c.constraint_type in ("U", "R")):
+            raise ValueError
         # İki dictionary kaynağı aynı kolon kimlik/sıra görüntüsünü vermeli.
         # Çelişki beklenen SQL'e karşı kesin fark değildir; FAILED yazdırmaz.
         if tuple((c.column_name, c.column_id) for c in actual.columns) != tuple(
@@ -1128,18 +1547,30 @@ def compare_table_structure(
     check("table.nested", "NO", safety.nested)
     check("table.secondary", "N", safety.secondary)
     for index, column in enumerate(safety.column_properties, 1):
-        check(f"properties[{index}].default_present", False, column.default_length is not None)
+        wanted = expected.column_definitions[index - 1] if index <= len(expected.column_definitions) else None
+        if wanted is not None and wanted.identity:
+            check(f"properties[{index}].identity_generation", "ALWAYS", column.identity_generation)
+            check(f"properties[{index}].identity_default", True, _identity_default_matches(column))
+        else:
+            check(f"properties[{index}].default_present", wanted is not None and wanted.default is not None,
+                  column.default_length is not None)
+            if wanted is not None and wanted.default is not None:
+                check(f"properties[{index}].default", wanted.default, _normalized_default(column.default_expression))
+        if column.default_length is not None:
+            check(f"properties[{index}].default_on_null", "NO", column.default_on_null)
         check(f"properties[{index}].hidden", "NO", column.hidden)
         check(f"properties[{index}].virtual", "NO", column.virtual)
-        check(f"properties[{index}].identity", "NO", column.identity)
+        check(f"properties[{index}].identity", "YES" if wanted is not None and wanted.identity else "NO", column.identity)
     constraint_pks = tuple(c for c in safety.constraints if c.constraint_type == "P")
     check("constraints.primary_key.count", int(primary_key is not None), len(constraint_pks))
     if primary_key is not None and len(constraint_pks) == 1:
         check("constraints.primary_key.name", primary_key.constraint_name, constraint_pks[0].constraint_name)
-    mandatory = {c.name for c in expected.column_definitions if c.explicit_not_null}
+    mandatory = {c.name for c in expected.column_definitions if c.explicit_not_null or c.identity}
     if expected.primary_key is not None:
         mandatory.update(expected.primary_key.columns)
     seen_not_null = set()
+    seen_active_checks = set()
+    expected_checks = {c.constraint_name: c for c in expected.active_checks}
     for index, constraint in enumerate(safety.constraints, 1):
         path = f"constraints[{index}]"
         check(path + ".status", "ENABLED", constraint.status)
@@ -1148,10 +1579,38 @@ def compare_table_structure(
         check(path + ".deferred", "IMMEDIATE", constraint.deferred)
         if constraint.constraint_type == "C":
             name = _not_null_column(constraint.condition)
-            check(path + ".not_null", True, name in mandatory and name not in seen_not_null)
-            seen_not_null.add(name)
-        elif constraint.constraint_type != "P":
+            if constraint.constraint_name in expected_checks:
+                check(path + ".active_check", True, _is_active_check(constraint.condition))
+                seen_active_checks.add(constraint.constraint_name)
+            else:
+                check(path + ".not_null", True, name in mandatory and name not in seen_not_null)
+                seen_not_null.add(name)
+        elif constraint.constraint_type not in ("P", "U", "R"):
             differences.append(StructureDifference(path + ".type", "UNSUPPORTED_CONSTRAINT"))
+    actual_uniques = {c.constraint_name: c for c in safety.constraints if c.constraint_type == "U"}
+    check("unique_constraints.count", len(expected.unique_constraints), len(actual_uniques))
+    for index, unique in enumerate(expected.unique_constraints, 1):
+        path = f"unique_constraints[{index}]"
+        metadata = actual_uniques.get(unique.constraint_name)
+        check(path + ".presence", True, metadata is not None)
+        if metadata is not None:
+            check(path + ".columns", (unique.column_name,), metadata.columns)
+    check("active_checks.names", set(expected_checks), seen_active_checks)
+    actual_fks = {c.constraint_name: c for c in safety.constraints if c.constraint_type == "R"}
+    check("foreign_keys.count", len(expected.foreign_keys), len(actual_fks))
+    for index, fk in enumerate(expected.foreign_keys, 1):
+        path = f"foreign_keys[{index}]"
+        metadata = actual_fks.get(fk.constraint_name)
+        check(path + ".presence", True, metadata is not None)
+        if metadata is not None:
+            check(path + ".columns", (fk.column_name,), metadata.columns)
+            ref = metadata.reference
+            check(path + ".owner", "HR_CORE", ref.owner)
+            check(path + ".table", fk.referenced_table, ref.table_name)
+            check(path + ".ref_columns", (fk.referenced_column,), ref.columns)
+            check(path + ".delete_rule", "NO ACTION", ref.delete_rule)
+            check(path + ".status", "ENABLED", ref.status)
+            check(path + ".validated", "VALIDATED", ref.validated)
     # Açık NOT NULL için bir CHECK kaydı zorunlu; yalnızca PK'den türeyen NOT
     # NULL için Oracle'ın ayrıca C kaydı üretmesi şart koşulmaz.
     check("constraints.explicit_not_null", True,
@@ -1177,7 +1636,7 @@ def compare_table_structure(
             check(path + ".char_used", "C", metadata.char_used)
         else:
             check(path + ".char_used", None, metadata.char_used)
-        effective_not_null = column.explicit_not_null or column.name in pk_columns
+        effective_not_null = column.explicit_not_null or column.identity or column.name in pk_columns
         check(path + ".nullable", "N" if effective_not_null else "Y", metadata.nullable)
 
     check("primary_key.presence", expected.primary_key is not None, primary_key is not None)
