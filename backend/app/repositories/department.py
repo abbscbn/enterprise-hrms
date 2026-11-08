@@ -41,3 +41,11 @@ class DepartmentRepository:
         with self.connection.cursor() as cursor:
             cursor.execute("UPDATE HR_CORE.DEPARTMENT SET IS_ACTIVE=0 WHERE ID=:id", {"id": identifier})
             updated_one(cursor)
+
+    def lock_for_assignment(self, old_department_id, new_department_id):
+        with self.connection.cursor() as cursor:
+            cursor.callproc('HR_CORE.HRMS_RULES.LOCK_FOR_ASSIGNMENT', [old_department_id, new_department_id])
+
+    def assert_no_active_employees(self, identifier):
+        with self.connection.cursor() as cursor:
+            cursor.callproc('HR_CORE.HRMS_RULES.ASSERT_DEPARTMENT_EMPTY', [identifier])

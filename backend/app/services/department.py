@@ -1,3 +1,4 @@
+import os
 from ..core.errors import Conflict
 from ..db.transactions import transaction
 from ..repositories.department import DepartmentRepository
@@ -39,7 +40,9 @@ class DepartmentService:
             current = require(self.departments.get(identifier, for_update=True))
             # Aynı departman kilidi personel ataması/taşınması tarafından da tutulur.
             # COUNT personel satırı kilitlemez; ters kilit sırası oluşturmaz.
-            if self.employees.has_active(identifier):
+            if os.environ.get("HRMS_PLSQL_ENABLED", "0") == "1":
+                self.departments.assert_no_active_employees(identifier)
+            elif self.employees.has_active(identifier):
                 raise Conflict()
             if current["is_active"]:
                 self.departments.deactivate(identifier)

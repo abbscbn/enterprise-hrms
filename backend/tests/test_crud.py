@@ -41,6 +41,7 @@ class OfflineCase(unittest.TestCase):
     def setUp(self):
         self.real_connect = self.enterContext(patch('oracledb.connect', side_effect=AssertionError('Gerçek Oracle yasak')))
         self.settings = self.enterContext(patch.object(config, 'load_dotenv', side_effect=AssertionError('.env okuma yasak')))
+        self.target = self.enterContext(patch("backend.app.db.transactions.validate_target_session"))
         self.connection = MagicMock()
         self.connection.autocommit = False
         self.cursor = MagicMock()

@@ -64,6 +64,10 @@ def safe_error(error: Exception) -> ApplicationError:
     if isinstance(error, oracledb.Error) and error.args:
         code = getattr(error.args[0], "code", None)
         if type(code) is int:
+            if code == 20003:
+                return NotFound()
+            if code in (20001, 20002):
+                return Conflict()
             if code == 1:
                 return UniqueConflict()
             if code in (2291, 2292):

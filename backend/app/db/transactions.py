@@ -1,5 +1,6 @@
 """Transaction sınırı service'e, bağlantı yaşam döngüsü dependency'ye aittir."""
 from contextlib import contextmanager
+from .session import validate_target_session
 from ..core.errors import ApplicationError, CommitOutcomeUnknown, TransactionCleanupError, safe_error
 
 
@@ -8,6 +9,7 @@ def transaction(connection):
     if connection.autocommit is not False:
         raise ApplicationError()
     try:
+        validate_target_session(connection)
         yield
     except BaseException as error:
         try:

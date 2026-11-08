@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "package": "HRMS_RULES",
+  "sha256": "d4d60f5ca35edd6ef7ae0785a0deed9ccad7e955b12019d8b254fc6b4761c939",
+  "files": {
+    "V0001__hrms_rules_spec.sql": "f23921e4028b37b13102a176f4e9bfb382e960f789430cd3dd8daec4e6b7dae1",
+    "V0001__hrms_rules_body.sql": "9bbebedd6bfa63b4d8dedaec027f0066df35de259ed153beda6bfb7ff746b0c1"
+  }
+}
