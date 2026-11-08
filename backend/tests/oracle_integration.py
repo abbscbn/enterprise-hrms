@@ -68,6 +68,9 @@ def run():
                               {'department_id': b['id'], 'email': 'integration@example.invalid'})
             if updated['department_id'] != b['id'] or updated['hire_date'] != '2026-01-02':
                 raise RuntimeError('FK/tarih eşleme kontrolü başarısız.')
+            moved_back = request('PATCH', '/employees/' + str(employee['id']), 200, {'department_id': a['id']})
+            if moved_back['department_id'] != a['id']:
+                raise RuntimeError('Reverse ordered department move failed.')
             request('GET', '/employees?page=1&size=5', 200)
             request('GET', '/employees/' + str(employee['id']), 200)
             request('PATCH', '/employees/' + str(employee['id']), 200, {'email': None})

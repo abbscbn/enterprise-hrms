@@ -1,0 +1,72 @@
+name: enterprise-hrms
+x-oracle-env: &oracle-env
+  DB_HOST: ${DB_HOST_DOCKER:-host.docker.internal}
+  DB_PORT: ${DB_PORT:-1521}
+  DB_SERVICE: ${DB_SERVICE:-FREEPDB1}
+  DB_USER: ${DB_USER:-HR_CORE}
+  DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD must be configured privately}
+x-broker-env: &broker-env
+  RABBITMQ_HOST: rabbitmq
+  RABBITMQ_USER: ${RABBITMQ_USER:?RABBITMQ_USER must be configured privately}
+  RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:?RABBITMQ_PASSWORD must be configured privately}
+services:
+  rabbitmq:
+    image: rabbitmq:4-management-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD}
+    ports: ["127.0.0.1:5672:5672", "127.0.0.1:15672:15672"]
+    volumes: [rabbitmq-data:/var/lib/rabbitmq]
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+  backend:
+    build: {context: ., dockerfile: backend/Dockerfile}
+    environment:
+      <<: *oracle-env
+      HRMS_OUTBOX_ENABLED: ${HRMS_OUTBOX_ENABLED:-0}
+      HRMS_PLSQL_ENABLED: ${HRMS_PLSQL_ENABLED:-0}
+    ports: ["127.0.0.1:8000:8000"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+  frontend:
+    build: {context: ., dockerfile: frontend/Dockerfile}
+    ports: ["127.0.0.1:5173:80"]
+    depends_on:
+      backend: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+  notifications:
+    build: {context: ., dockerfile: notification_service/Dockerfile}
+    environment:
+      <<: *broker-env
+      INBOX_PATH: /var/lib/hrms-events/inbox.sqlite
+    ports: ["127.0.0.1:5001:5000"]
+    volumes: [notification-data:/var/lib/hrms-events]
+    depends_on:
+      rabbitmq: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+  outbox:
+    profiles: [events]
+    build: {context: ., dockerfile: backend/Dockerfile}
+    environment:
+      <<: [*oracle-env, *broker-env]
+    command: ["python", "-m", "backend.app.events.relay"]
+    depends_on:
+      rabbitmq: {condition: service_healthy}
+    # No automatic restart: an uncertain Oracle commit needs manual review.
+volumes:
+  rabbitmq-data:
+  notification-data:

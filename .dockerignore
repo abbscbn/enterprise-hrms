@@ -1,0 +1,14 @@
+.git
+.env
+.env.*
+.venv
+**/node_modules
+**/dist
+**/__pycache__
+**/*.pyc
+**/*.sqlite*
+**/*.log
+.codex
+.agents
+**/*.tsbuildinfo
+**/coverage
